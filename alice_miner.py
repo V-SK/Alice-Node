@@ -16,6 +16,7 @@ import os
 import platform
 import subprocess
 import tempfile
+import threading
 import time
 import zlib
 from pathlib import Path
@@ -1681,6 +1682,30 @@ def _cleanup_stale_temp_files():
         print("✅ Startup cleanup: no stale files found")
 
 
+def _heartbeat_worker(ps_url: str, auth_token: str, interval: int = 300, stop_event: threading.Event = None):
+    """Background heartbeat to keep miner active on PS during long training."""
+    while not (stop_event and stop_event.is_set()):
+        try:
+            resp = requests.post(
+                f"{ps_url}/heartbeat",
+                headers={"Authorization": f"Bearer {auth_token}"},
+                json={"status": "training"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                pass  # silent success
+            else:
+                print(f"⚠️ Heartbeat returned {resp.status_code}")
+        except Exception:
+            pass  # Don't crash on heartbeat failure
+
+        # Sleep in small chunks so stop_event is responsive
+        for _ in range(interval):
+            if stop_event and stop_event.is_set():
+                break
+            time.sleep(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Alice Miner V2 - Tiered Training")
     parser.add_argument("--ps-url", required=True, help="Parameter server URL")
@@ -1759,9 +1784,16 @@ def main():
     # Startup cleanup: remove stale temp files from previous crashed downloads.
     _cleanup_stale_temp_files()
 
+    # Heartbeat state (managed across re-registration loops).
+    heartbeat_stop: Optional[threading.Event] = None
+
     # Never exit on transient errors; only Ctrl+C stops the miner.
     while True:
         try:
+            # Stop previous heartbeat if re-registering.
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
+                heartbeat_stop = None
             # Get hardware capabilities (auto-detect unless overridden).
             capabilities = get_hardware_info(args.device)
             profile_key = device_profile_key(wallet_address, capabilities)
@@ -1794,6 +1826,16 @@ def main():
                 print("❌ Registration succeeded but no auth token returned; retrying in 30s...")
                 time.sleep(30)
                 continue
+
+            # Start heartbeat thread
+            heartbeat_stop = threading.Event()
+            heartbeat_thread = threading.Thread(
+                target=_heartbeat_worker,
+                args=(args.ps_url, auth_token, 300, heartbeat_stop),
+                daemon=True,
+            )
+            heartbeat_thread.start()
+            print("💓 Heartbeat started (every 5min)")
 
             # Use first assigned task to learn layer assignment + model version.
             print("📥 Requesting task to get layer assignment...")
@@ -2400,6 +2442,10 @@ def main():
 
         except KeyboardInterrupt:
             print("\n🛑 Miner stopped by user")
+            try:
+                heartbeat_stop.set()
+            except Exception:
+                pass
             return
         except Exception as e:
             print(f"❌ Unexpected error: {e}. Restarting in 30s...")
