@@ -48,27 +48,44 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$ADDRESS" ]]; then
-  # No address: need interactive wallet creation/unlock first
+  # No address provided: check local wallet, or create one
   WALLET_FILE="$HOME/.alice/wallet.json"
   if [[ -f "$WALLET_FILE" ]]; then
-    # Wallet exists, read address from it
     ADDRESS=$("$PYTHON_BIN" -c "import json; print(json.load(open('$WALLET_FILE'))['address'])" 2>/dev/null || true)
-    if [[ -z "$ADDRESS" ]]; then
-      echo "⚠️ Could not read address from $WALLET_FILE"
-      echo "Run: python3 alice_miner.py --ps-url $PS_URL  (to unlock wallet interactively)"
-      exit 1
+    if [[ -n "$ADDRESS" ]]; then
+      echo "🔑 Found local wallet: $ADDRESS"
     fi
-    echo "🔑 Using wallet: $ADDRESS"
-  else
-    # No wallet file — run miner once interactively to create wallet
-    echo "🔐 No wallet found. Creating one now..."
+  fi
+
+  if [[ -z "$ADDRESS" ]]; then
+    echo "No wallet found and no --address provided."
     echo ""
-    "$PYTHON_BIN" -c "from core.secure_wallet import get_or_create_wallet_for_miner; w = get_or_create_wallet_for_miner(); print(f'✅ Wallet ready: {w.address}')"
-    ADDRESS=$("$PYTHON_BIN" -c "import json; print(json.load(open('$WALLET_FILE'))['address'])" 2>/dev/null || true)
-    if [[ -z "$ADDRESS" ]]; then
-      echo "❌ Wallet creation failed"
-      exit 1
-    fi
+    echo "Choose one:"
+    echo "  1) Create a new wallet now"
+    echo "  2) Enter an existing Alice address"
+    echo ""
+    read -rp "Enter choice [1/2]: " CHOICE
+    case "$CHOICE" in
+      1)
+        "$PYTHON_BIN" -c "from core.secure_wallet import get_or_create_wallet_for_miner; w = get_or_create_wallet_for_miner(); print(f'✅ Wallet ready: {w.address}')"
+        ADDRESS=$("$PYTHON_BIN" -c "import json; print(json.load(open('$WALLET_FILE'))['address'])" 2>/dev/null || true)
+        if [[ -z "$ADDRESS" ]]; then
+          echo "❌ Wallet creation failed"
+          exit 1
+        fi
+        ;;
+      2)
+        read -rp "Enter your Alice address: " ADDRESS
+        if [[ -z "$ADDRESS" ]]; then
+          echo "❌ No address entered"
+          exit 1
+        fi
+        ;;
+      *)
+        echo "❌ Invalid choice"
+        exit 1
+        ;;
+    esac
     echo ""
   fi
 fi
