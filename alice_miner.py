@@ -912,6 +912,7 @@ def request_delta_update(ps_url: str, from_version: int, auth_token: Optional[st
 def download_model_streaming(ps_url: str, save_path: Path, auth_token: Optional[str] = None) -> bool:
     """Download model using streaming to avoid memory spikes."""
     print("📥 Downloading model (streaming)...")
+    tmp_path = None
     
     try:
         with requests.get(
@@ -946,6 +947,13 @@ def download_model_streaming(ps_url: str, save_path: Path, auth_token: Optional[
         
     except Exception as e:
         print(f"❌ Model download failed: {e}")
+        # Clean up temp file on failure to prevent disk leaks
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+                print(f"🧹 Cleaned up temp file: {tmp_path}")
+            except OSError:
+                pass
         return False
 
 
@@ -1637,6 +1645,42 @@ def submit_gradient(
     return False
 
 
+def _cleanup_stale_temp_files():
+    """Remove leftover .pt temp files from /tmp and .tmp model caches on startup."""
+    cleaned = 0
+
+    # 1. /tmp/*.pt — leaked by download_model_streaming (NamedTemporaryFile)
+    tmp_dir = Path(tempfile.gettempdir())
+    for f in tmp_dir.glob("tmp*.pt"):
+        try:
+            age_hours = (time.time() - f.stat().st_mtime) / 3600
+            if age_hours > 1:  # Only clean files older than 1 hour
+                size_mb = f.stat().st_size / (1024 * 1024)
+                f.unlink()
+                print(f"🧹 Cleaned stale temp: {f.name} ({size_mb:.0f} MB, {age_hours:.1f}h old)")
+                cleaned += 1
+        except OSError:
+            pass
+
+    # 2. *.pt.tmp — stale partial downloads next to model cache
+    cwd = Path.cwd()
+    for f in list(cwd.glob("*.pt.tmp")) + list(Path.home().glob(".alice/*.pt.tmp")):
+        try:
+            age_hours = (time.time() - f.stat().st_mtime) / 3600
+            if age_hours > 2:  # Partial downloads older than 2 hours are stale
+                size_mb = f.stat().st_size / (1024 * 1024)
+                f.unlink()
+                print(f"🧹 Cleaned stale partial: {f.name} ({size_mb:.0f} MB, {age_hours:.1f}h old)")
+                cleaned += 1
+        except OSError:
+            pass
+
+    if cleaned:
+        print(f"🧹 Startup cleanup: removed {cleaned} stale file(s)")
+    else:
+        print("✅ Startup cleanup: no stale files found")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Alice Miner V2 - Tiered Training")
     parser.add_argument("--ps-url", required=True, help="Parameter server URL")
@@ -1715,6 +1759,9 @@ def main():
     gradients_accepted = 0
     gradients_rejected = 0
     profile_path = device_profile_path()
+
+    # Startup cleanup: remove stale temp files from previous crashed downloads.
+    _cleanup_stale_temp_files()
 
     # Never exit on transient errors; only Ctrl+C stops the miner.
     while True:
