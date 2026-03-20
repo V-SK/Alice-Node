@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+.env*
+*.pt
+*.bin
+logs/
+models/
+.alice/
+wallet.json
+*.bak
+*.bak.*
+venv/
+.venv/

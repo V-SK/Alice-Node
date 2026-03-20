@@ -1,0 +1,8 @@
+# CPU: pip install torch
+# GPU: pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch
+substrate-interface>=1.7.0
+cryptography
+requests
+psutil
+mnemonic
