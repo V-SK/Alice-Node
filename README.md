@@ -1,6 +1,12 @@
 # Alice Miner
 
+[中文版 →](README_CN.md)
+
 Mine **ALICE** tokens by training AI. GPU miner for [Alice Protocol](https://aliceprotocol.org) — the decentralized AI training network.
+
+## What is Alice?
+
+Alice is training AI from scratch — no fine-tuning, no corporate models, no dependencies. Every weight is computed by the network's miners. You contribute GPU power, earn ALICE tokens proportional to your gradient quality.
 
 ## Requirements
 
@@ -14,7 +20,7 @@ Mine **ALICE** tokens by training AI. GPU miner for [Alice Protocol](https://ali
 
 **Supported GPUs:** RTX 3090, RTX 4090, A5000, A6000, RTX PRO 4000, and other 24GB+ NVIDIA GPUs.
 
-**Experimental:** Apple Silicon (MPS) with 16GB+ unified memory.
+**Experimental:** Apple Silicon (MPS) with 32GB+ unified memory (M1/M2/M3/M4 Max).
 
 ## Quick Start
 
@@ -82,30 +88,41 @@ python alice_miner.py \
 
 ## How It Works
 
-1. **Connect** — Miner connects to the Parameter Server and downloads the current model (~13GB)
+1. **Connect** — Miner connects to the Parameter Server and downloads the current model (~13 GB)
 2. **Train** — Receives a data shard, trains assigned layers, computes gradients
 3. **Submit** — Compresses gradients (TopK 0.1% + zlib) and submits to PS
-4. **Score** — PS scores gradient quality (loss improvement)
+4. **Score** — Independent validators score gradient quality (loss improvement)
 5. **Earn** — ALICE tokens distributed proportional to your score contribution
 
 ### Layer Assignment
 
-The miner automatically detects your GPU VRAM and assigns layers:
+The miner auto-detects your GPU VRAM and assigns layers:
 
 | VRAM | Layers | Notes |
 |------|--------|-------|
 | 24 GB (CUDA) | 24 | Most consumer GPUs |
-| 40 GB+ (CUDA) | 32 | Full model, A6000 etc |
-| 16 GB (MPS) | 14 | Apple Silicon |
+| 40 GB+ (CUDA) | 32 | Full model (A6000, etc.) |
+| 32 GB (MPS) | 30 | Apple Silicon Max chips |
+| 16 GB (MPS) | 14 | Apple Silicon (experimental) |
 | CPU | 4 | Not recommended |
 
 ## Rewards
 
-- **~600 ALICE per epoch** (Year 1-2)
-- Epoch duration: ~60 minutes
-- Rewards split: **99% miners**, 1% infrastructure
-- Distribution: proportional to gradient score
-- Halving: every 2 years
+- **Total supply:** 21,000,000 ALICE (never more)
+- **Year 1-2 budget:** 5,250,000 ALICE/year, halving every 2 years
+- **Per-epoch reward:** ~600 ALICE (epoch ≈ 60 minutes)
+- **Trainer share:** 56-90% (dynamic, based on network composition)
+- **Infrastructure:** fixed 9% (validators 5% + aggregators 2% + scheduler 2%)
+- **Distribution:** proportional to your gradient score vs total score
+
+### Solo vs Pool
+
+| Mode | Effective Hashrate | Notes |
+|------|-------------------|-------|
+| Solo | 15-25% | Direct submission, higher staleness |
+| Pool | 30-45% | Internal aggregation, optimizers, more stable |
+
+Joining a mining pool can roughly **double** your effective contribution.
 
 ## Vast.ai Setup
 
