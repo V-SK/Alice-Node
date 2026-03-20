@@ -14,12 +14,20 @@ EXTRA_ARGS=()
 usage() {
   cat <<EOF
 Usage:
-  ./start_mining.sh --address a1... [--gpus 0,1,2,3|all|cpu|mps] [--ps-url URL] [--precision fp16|fp32|auto] [--dry-run]
+  ./start_mining.sh [--address a1...] [--gpus 0,1,2,3|all|cpu|mps] [--ps-url URL] [--precision fp16|fp32|auto] [--dry-run]
 
-Examples:
+First run (creates wallet automatically):
+  ./start_mining.sh
+
+With existing wallet:
+  ./start_mining.sh --gpus all
+
+With address override:
   ./start_mining.sh --address a1xxxx --gpus 0,1,2,3
-  ./start_mining.sh --address a1xxxx --gpus all
-  ./start_mining.sh --address a1xxxx --gpus cpu
+
+For background/unattended mode, set wallet password:
+  export ALICE_WALLET_PASSWORD="your_password"
+  ./start_mining.sh
 EOF
 }
 
@@ -40,9 +48,29 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$ADDRESS" ]]; then
-  echo "Error: --address is required"
-  usage
-  exit 1
+  # No address: need interactive wallet creation/unlock first
+  WALLET_FILE="$HOME/.alice/wallet.json"
+  if [[ -f "$WALLET_FILE" ]]; then
+    # Wallet exists, read address from it
+    ADDRESS=$("$PYTHON_BIN" -c "import json; print(json.load(open('$WALLET_FILE'))['address'])" 2>/dev/null || true)
+    if [[ -z "$ADDRESS" ]]; then
+      echo "⚠️ Could not read address from $WALLET_FILE"
+      echo "Run: python3 alice_miner.py --ps-url $PS_URL  (to unlock wallet interactively)"
+      exit 1
+    fi
+    echo "🔑 Using wallet: $ADDRESS"
+  else
+    # No wallet file — run miner once interactively to create wallet
+    echo "🔐 No wallet found. Creating one now..."
+    echo ""
+    "$PYTHON_BIN" -c "from core.secure_wallet import get_or_create_wallet_for_miner; w = get_or_create_wallet_for_miner(); print(f'✅ Wallet ready: {w.address}')"
+    ADDRESS=$("$PYTHON_BIN" -c "import json; print(json.load(open('$WALLET_FILE'))['address'])" 2>/dev/null || true)
+    if [[ -z "$ADDRESS" ]]; then
+      echo "❌ Wallet creation failed"
+      exit 1
+    fi
+    echo ""
+  fi
 fi
 
 if [[ ! -f "$MINER_SCRIPT" ]]; then
@@ -98,7 +126,10 @@ for t in "${TARGETS[@]}"; do
 
   INSTANCE_ID=""
   LOG_PATH=""
-  CMD=("$PYTHON_BIN" "$MINER_SCRIPT" "--ps-url" "$PS_URL" "--address" "$ADDRESS" "--precision" "$PRECISION")
+  CMD=("$PYTHON_BIN" "$MINER_SCRIPT" "--ps-url" "$PS_URL" "--precision" "$PRECISION")
+  if [[ -n "$ADDRESS" ]]; then
+    CMD+=("--address" "$ADDRESS")
+  fi
   CMD+=("${ALLOW_INSECURE_ARGS[@]}")
 
   if [[ "$t" == "cpu" || "$t" == "mps" ]]; then
