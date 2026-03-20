@@ -18,9 +18,9 @@ Alice is training AI from scratch — no fine-tuning, no corporate models, no de
 | Network | 10 Mbps | 50 Mbps+ |
 | Python | 3.10+ | 3.11+ |
 
-**Supported GPUs:** RTX 3090, RTX 4090, A5000, A6000, RTX PRO 4000, and other 24GB+ NVIDIA GPUs.
+**Supported GPUs:** Any NVIDIA GPU with 24GB+ VRAM (RTX 3090, 4090, A5000, A6000, etc.)
 
-**Experimental:** Apple Silicon (MPS) with 32GB+ unified memory (M1/M2/M3/M4 Max).
+**Also supported:** Any Apple Silicon Mac (M-chip) with 24GB+ unified memory.
 
 ## Quick Start
 

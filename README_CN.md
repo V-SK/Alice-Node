@@ -18,9 +18,9 @@ Alice 从零开始训练 AI — 不微调、不依赖任何企业模型。每一
 | 网络 | 10 Mbps | 50 Mbps+ |
 | Python | 3.10+ | 3.11+ |
 
-**支持的 GPU**：RTX 3090、RTX 4090、A5000、A6000、RTX PRO 4000，以及其他 24GB+ NVIDIA 显卡。
+**支持的 GPU**：任何 24GB+ 显存的 NVIDIA GPU（RTX 3090、4090、A5000、A6000 等）
 
-**实验性支持**：Apple Silicon (MPS)，需要 32GB+ 统一内存（M1/M2/M3/M4 Max）。
+**同样支持**：任何 24GB+ 统一内存的 Apple Silicon Mac（M芯片）。
 
 ## 快速开始
 
