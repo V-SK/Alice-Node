@@ -1640,7 +1640,7 @@ def submit_gradient(
 def main():
     parser = argparse.ArgumentParser(description="Alice Miner V2 - Tiered Training")
     parser.add_argument("--ps-url", required=True, help="Parameter server URL")
-    parser.add_argument("--wallet", default=None, help="Wallet address override (debug only)")
+    parser.add_argument("--wallet", "--address", default=None, help="Wallet address override")
     parser.add_argument("--wallet-path", type=Path, default=DEFAULT_WALLET_PATH, help="Wallet file path")
     parser.add_argument(
         "--allow-insecure",
