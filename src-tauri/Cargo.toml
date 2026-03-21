@@ -59,3 +59,7 @@ nvml-wrapper = "0.9"
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 
+
+[target.'cfg(target_os = "linux")'.dependencies.webkit2gtk]
+version = "0.18"
+features = ["v2_22"]
