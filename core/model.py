@@ -238,6 +238,11 @@ class LlamaNanoModel(nn.Module):
         return logits, loss
 
 
+# Aliases for backward compatibility
+AliceConfig = LlamaNanoConfig
+AliceForCausalLM = LlamaNanoModel
+
+
 def count_parameters(model: nn.Module) -> int:
     """Return the total number of trainable parameters."""
 
