@@ -7,7 +7,8 @@ Requests tasks from PS, downloads shards on-demand, trains assigned layers, and 
 import argparse
 import base64
 import contextlib
-import fcntl
+if sys.platform != "win32":
+    import fcntl
 import hashlib
 import json
 import logging
@@ -319,7 +320,11 @@ def acquire_single_instance_lock() -> Any:
     PIDFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
     lock_fp = PIDFILE_PATH.open("w", encoding="utf-8")
     try:
-        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(lock_fp.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         print("❌ Another miner instance is already running. Exiting.")
         sys.exit(1)
