@@ -184,6 +184,34 @@ class LlamaNanoConfig:
     rope_base: float = 10000.0
     max_seq_len: int = 2048
 
+    # Alias map: alternative name -> canonical field name
+    _ALIASES = {
+        'intermediate_size': 'hidden_dim',
+        'num_attention_heads': 'n_heads',
+        'num_hidden_layers': 'n_layers',
+        'num_layers': 'n_layers',
+        'head_dim': None,  # computed
+    }
+
+    def __getattr__(self, name):
+        aliases = LlamaNanoConfig._ALIASES
+        if name in aliases:
+            target = aliases[name]
+            if target is None:
+                # head_dim: computed
+                return self.dim // self.n_heads
+            return getattr(self, target)
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+    def __setattr__(self, name, value):
+        aliases = LlamaNanoConfig._ALIASES
+        if name in aliases:
+            target = aliases[name]
+            if target is not None:
+                object.__setattr__(self, target, value)
+                return
+        object.__setattr__(self, name, value)
+
 
 class LlamaNanoModel(nn.Module):
     """A compact Llama-style transformer (~100M params with default config)."""
