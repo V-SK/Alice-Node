@@ -1785,8 +1785,21 @@ def main():
                     local_version = meta.get("version", -1)
                     local_layers = meta.get("layers", [])
                     if local_version == ps_version and local_layers == assigned_layers:
-                        print(f"✅ Cached model valid (version {local_version}, {len(local_layers)} layers)")
-                        need_download = False
+                        # Verify dim matches (prevents stale 768-dim cache after PS model change)
+                        try:
+                            _probe = torch.load(model_path, map_location="cpu", mmap=True, weights_only=True)
+                            _emb = _probe.get("model.embed_tokens.weight")
+                            _cached_dim = int(_emb.shape[1]) if isinstance(_emb, torch.Tensor) and _emb.ndim == 2 else 0
+                            del _probe
+                            if _cached_dim > 0 and _cached_dim != meta.get("dim", _cached_dim):
+                                print(f"⚠️ Cache dim mismatch: meta={meta.get('dim')} vs file={_cached_dim}, re-downloading")
+                                need_download = True
+                            else:
+                                print(f"✅ Cached model valid (version {local_version}, {len(local_layers)} layers, dim={_cached_dim})")
+                                need_download = False
+                        except Exception:
+                            print("⚠️ Could not verify cached model dimensions, re-downloading")
+                            need_download = True
                     elif local_version + 1 == ps_version and local_layers == assigned_layers:
                         # Try delta update
                         print(f"🔄 Attempting delta update (v{local_version} → v{ps_version})...")
