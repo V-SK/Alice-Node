@@ -50,7 +50,8 @@ impl Default for MiningProcess {
 
 pub type MiningProcessState = Mutex<MiningProcess>;
 
-fn get_miner_binary_path() -> std::path::PathBuf {
+/// Try to find the bundled miner binary; fall back to Python.
+fn get_miner_command() -> (String, Vec<String>) {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
@@ -58,16 +59,21 @@ fn get_miner_binary_path() -> std::path::PathBuf {
 
     #[cfg(target_os = "windows")]
     let binary_name = "alice-miner-core.exe";
-
     #[cfg(not(target_os = "windows"))]
     let binary_name = "alice-miner-core";
 
-    exe_dir.join(binary_name)
-}
+    let binary_path = exe_dir.join(binary_name);
+    if binary_path.exists() {
+        return (binary_path.to_string_lossy().to_string(), vec![]);
+    }
 
-fn get_model_path() -> std::path::PathBuf {
-    let home = dirs::home_dir().unwrap_or_default();
-    home.join(".alice-miner").join("models")
+    // Fallback: use Python
+    #[cfg(target_os = "windows")]
+    let python = "python";
+    #[cfg(not(target_os = "windows"))]
+    let python = "python3";
+
+    (python.to_string(), vec!["alice_miner.py".to_string()])
 }
 
 #[tauri::command]
@@ -83,39 +89,22 @@ pub fn start_mining(
         return Err("Mining is already running".to_string());
     }
 
-    let miner_path = get_miner_binary_path();
-    if !miner_path.exists() {
-        return Err(format!(
-            "Miner binary not found at {:?}. Please download it first.",
-            miner_path
-        ));
-    }
-
-    let model_path = get_model_path();
-    if !model_path.join("model_int8.pt").exists() && !model_path.join("model_fp16.pt").exists() {
-        return Err("Model not found. Please download the model first.".to_string());
-    }
-
-    // Determine which model to use
-    let model_file = if model_path.join("model_fp16.pt").exists() {
-        model_path.join("model_fp16.pt")
-    } else {
-        model_path.join("model_int8.pt")
-    };
-
     process.state.status = MiningStatus::Starting;
     process.state.wallet_address = Some(wallet_address.clone());
     process.state.gpu_index = gpu_index;
 
-    let mut cmd = Command::new(&miner_path);
+    let (program, prefix_args) = get_miner_command();
+    let mut cmd = Command::new(&program);
+    for arg in &prefix_args {
+        cmd.arg(arg);
+    }
     cmd.arg("--ps-url")
-        .arg("wss://ps.aliceprotocol.org")
+        .arg("https://ps.aliceprotocol.org")
         .arg("--wallet")
         .arg(&wallet_address)
-        .arg("--gpu")
-        .arg(gpu_index.to_string())
-        .arg("--model-path")
-        .arg(&model_file)
+        .arg("--device")
+        .arg(if gpu_index == 999 { "cpu".to_string() } else { "cuda".to_string() })
+        .arg("--allow-insecure")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
