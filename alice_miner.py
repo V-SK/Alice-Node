@@ -1633,8 +1633,8 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=2,
-        help="Max batch size cap (default: 2)",
+        default=0,
+        help="Max batch size cap (0 = auto-detect based on GPU memory)",
     )
     parser.add_argument(
         "--lr",
