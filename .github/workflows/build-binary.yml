@@ -1,0 +1,57 @@
+name: Build Miner Binary
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact: alice-miner-core-linux-x64
+          - os: macos-latest
+            artifact: alice-miner-core-macos-arm64
+          - os: windows-latest
+            artifact: alice-miner-core-windows-x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      - name: Build binary
+        run: pyinstaller alice-miner.spec
+
+      - name: Rename artifact
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            mv dist/alice-miner-core.exe dist/${{ matrix.artifact }}.exe
+          else
+            mv dist/alice-miner-core dist/${{ matrix.artifact }}
+            chmod +x dist/${{ matrix.artifact }}
+          fi
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/${{ matrix.artifact }}*
