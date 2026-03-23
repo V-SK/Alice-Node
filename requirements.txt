@@ -1,8 +1,8 @@
-# CPU: pip install torch
-# GPU: pip install torch --index-url https://download.pytorch.org/whl/cu121
-torch
+# PyTorch is installed by install.sh with correct GPU support
+# Do NOT add torch here — it would override the GPU-specific version
 substrate-interface>=1.7.0
 cryptography
 requests
 psutil
 mnemonic
+numpy
