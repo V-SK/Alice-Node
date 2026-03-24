@@ -39,6 +39,7 @@ import hashlib
 import logging
 import argparse
 import asyncio
+import threading
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Any
 
@@ -366,16 +367,26 @@ def _compute_validation_loss(
 # =============================================================================
 
 class ScoringServer:
-    def __init__(self, model, validation_shards, device, model_version=0):
+    def __init__(self, model, validation_shards, device, model_version=0,
+                 ps_url="", model_path=""):
         self.model = model
         self.validation_shards = validation_shards
         self.device = device
         self.model_version = model_version
+        self.ps_url = ps_url.rstrip("/") if ps_url else ""
+        self.model_path = model_path  # Path to current model file on disk
         self.busy = False
         self.scored_count = 0
         self.total_time = 0.0
         self._scored_ids = set()  # Idempotency tracking
         self._scored_results = {}  # Cache for idempotent responses
+        self._model_lock = threading.Lock()
+
+        # Start background model update loop (checks PS every 5 min)
+        if self.ps_url:
+            threading.Thread(target=self._model_update_loop, daemon=True,
+                             name="model_update").start()
+            log.info(f"[AUTO-UPDATE] Enabled, checking {self.ps_url} every 300s")
 
     async def handle_score(self, request: web.Request) -> web.Response:
         """
@@ -502,6 +513,176 @@ class ScoringServer:
             )
         finally:
             self.busy = False
+
+    # ================================================================
+    # Background model auto-update (delta / full download from PS)
+    # ================================================================
+
+    def _model_update_loop(self):
+        """Background thread: check PS for model updates every 300s."""
+        time.sleep(30)  # Initial delay — let server start up
+        while True:
+            try:
+                self._check_and_apply_updates()
+            except Exception as e:
+                log.error(f"[AUTO-UPDATE] loop error: {e}", exc_info=True)
+            time.sleep(300)  # 5 minutes
+
+    def _check_and_apply_updates(self):
+        """Check PS model version; pull deltas or full model if behind."""
+        import requests as _requests  # stdlib-compat, no new dep
+
+        try:
+            resp = _requests.get(f"{self.ps_url}/model/info", timeout=15)
+            if resp.status_code != 200:
+                log.warning(f"[AUTO-UPDATE] /model/info returned {resp.status_code}")
+                return
+            info = resp.json()
+        except Exception as e:
+            log.warning(f"[AUTO-UPDATE] failed to reach PS: {e}")
+            return
+
+        ps_version = info.get("model_version", 0)
+        if ps_version <= self.model_version:
+            return  # Already up to date
+
+        gap = ps_version - self.model_version
+        log.info(f"[AUTO-UPDATE] PS v{ps_version} > local v{self.model_version} (gap={gap})")
+
+        if gap > 10:
+            # Too far behind — full download
+            log.info(f"[AUTO-UPDATE] gap={gap} > 10, downloading full model...")
+            self._download_full_model_sync(ps_version)
+        else:
+            # Incremental delta updates
+            current = self.model_version
+            for v in range(current, ps_version):
+                ok = self._fetch_and_apply_delta(v)
+                if not ok:
+                    log.warning(f"[AUTO-UPDATE] delta from v{v} failed, falling back to full download")
+                    self._download_full_model_sync(ps_version)
+                    return
+            log.info(f"[AUTO-UPDATE] ✅ Incremental update complete → v{self.model_version}")
+
+    def _fetch_and_apply_delta(self, from_version: int) -> bool:
+        """Fetch single delta from PS and apply to in-memory model."""
+        import requests as _requests
+
+        try:
+            resp = _requests.get(
+                f"{self.ps_url}/model/delta",
+                params={"from_version": from_version},
+                timeout=120,
+            )
+            if resp.status_code != 200:
+                log.warning(f"[AUTO-UPDATE] delta from v{from_version}: HTTP {resp.status_code}")
+                return False
+
+            delta_payload = resp.json()
+        except Exception as e:
+            log.warning(f"[AUTO-UPDATE] delta fetch failed: {e}")
+            return False
+
+        return self._apply_delta(delta_payload, from_version)
+
+    def _apply_delta(self, delta_payload: dict, from_version: int) -> bool:
+        """
+        Apply compressed delta to the in-memory model.
+        delta_payload is binary_v2 compressed format (same as miner gradients).
+        Uses decompress_gradients_sparse (already in this file) then scatters to model params.
+        """
+        try:
+            # decompress_gradients_sparse returns {name: {indices, values, shape}}
+            sparse_delta = decompress_gradients_sparse(delta_payload)
+
+            with self._model_lock:
+                param_dict = dict(self.model.named_parameters())
+                updated = 0
+                for name, sdata in sparse_delta.items():
+                    param = param_dict.get(name)
+                    if param is None:
+                        continue
+                    indices = sdata["indices"]
+                    values = sdata["values"].to(param.dtype).to(param.device)
+                    # Scatter into dense parameter
+                    flat = param.data.view(-1)
+                    flat[indices.to(param.device)] += values
+                    updated += 1
+
+                self.model_version = from_version + 1
+                self._scored_results.clear()  # Invalidate scoring cache
+
+            log.info(f"[AUTO-UPDATE] Applied delta v{from_version}→v{self.model_version}, {updated} params updated")
+            return True
+
+        except Exception as e:
+            log.error(f"[AUTO-UPDATE] _apply_delta failed: {e}", exc_info=True)
+            return False
+
+    def _download_full_model_sync(self, target_version: int):
+        """Download full model from PS and hot-reload (blocking, runs in bg thread)."""
+        import requests as _requests
+
+        model_dir = Path(os.environ.get("MODEL_DIR", "/tmp/alice-models"))
+        model_dir.mkdir(parents=True, exist_ok=True)
+        dest = model_dir / f"model_v{target_version}.pt"
+        tmp_path = str(dest) + ".downloading"
+
+        # Get download URL from PS
+        try:
+            info_resp = _requests.get(f"{self.ps_url}/model/info", timeout=15)
+            info = info_resp.json() if info_resp.status_code == 200 else {}
+            download_url = info.get("download_url", "")
+            if not download_url:
+                download_url = f"{self.ps_url}/models/v{target_version}_full.pt"
+            elif download_url.startswith("/"):
+                download_url = f"{self.ps_url}{download_url}"
+        except Exception:
+            download_url = f"{self.ps_url}/models/v{target_version}_full.pt"
+
+        log.info(f"[AUTO-UPDATE] Downloading full model v{target_version} from {download_url}")
+
+        try:
+            resp = _requests.get(download_url, stream=True, timeout=3600)
+            if resp.status_code != 200:
+                log.error(f"[AUTO-UPDATE] Full model download failed: HTTP {resp.status_code}")
+                return
+
+            downloaded = 0
+            last_log = 0
+            total = int(resp.headers.get("content-length", 0))
+            with open(tmp_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if downloaded - last_log >= 50 * 1024 * 1024:
+                        if total:
+                            pct = downloaded * 100 / total
+                            log.info(f"[AUTO-UPDATE] Download: {downloaded/1e6:.0f}MB / {total/1e6:.0f}MB ({pct:.1f}%)")
+                        else:
+                            log.info(f"[AUTO-UPDATE] Download: {downloaded/1e6:.0f}MB")
+                        last_log = downloaded
+
+            os.replace(tmp_path, str(dest))
+            log.info(f"[AUTO-UPDATE] Downloaded {downloaded/1e6:.1f}MB → {dest}")
+
+            # Hot reload
+            with self._model_lock:
+                new_model = load_model(str(dest), self.device)
+                self.model = new_model
+                self.model_version = target_version
+                self._scored_results.clear()
+
+            log.info(f"[AUTO-UPDATE] ✅ Full model v{target_version} loaded, hot-reloaded")
+
+        except Exception as e:
+            log.error(f"[AUTO-UPDATE] full download failed: {e}", exc_info=True)
+            # Clean up partial download
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     async def handle_health(self, request: web.Request) -> web.Response:
         """GET /health — liveness + status"""
@@ -633,6 +814,7 @@ def parse_args():
     parser.add_argument("--device", default="auto", help="Device: auto, cuda, mps, cpu")
     parser.add_argument("--model-version", type=int, default=0, help="Initial model version")
     parser.add_argument("--num-val-shards", type=int, default=NUM_VALIDATION_SHARDS, help="Number of validation shards to use")
+    parser.add_argument("--ps-url", default="", help="Parameter Server URL for auto-update (empty = disabled)")
     return parser.parse_args()
 
 
@@ -660,6 +842,8 @@ def main():
         validation_shards=validation_shards,
         device=device,
         model_version=args.model_version,
+        ps_url=args.ps_url,
+        model_path=args.model_path,
     )
 
     app = web.Application()

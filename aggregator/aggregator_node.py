@@ -313,10 +313,7 @@ class AggregatorNode:
                         self._handle_epoch_end()
                         self._start_new_epoch(ps_epoch)
 
-                    # Check for model updates
-                    ps_model_v = status.get("model_version", 0)
-                    if ps_model_v > self.model_version:
-                        self._pull_model_delta(ps_model_v)
+                    # Model updates handled by _model_update_loop
 
             except Exception as e:
                 log.warning(f"[EPOCH SYNC] failed: {e}")
@@ -393,25 +390,241 @@ class AggregatorNode:
 
         log.info(f"[EPOCH {self.current_epoch}] Started, {len(self.miners)} miners")
 
-    def _pull_model_delta(self, target_version):
-        """Pull model delta from PS."""
+    # ============================================
+    # Background model auto-update (delta / full)
+    # ============================================
+
+    def _model_update_loop(self):
+        """Background thread: check PS for model updates every 300s."""
+        time.sleep(60)  # Initial delay — let epoch sync init first
+        while True:
+            try:
+                self._check_and_apply_updates()
+            except Exception as e:
+                log.error(f"[AUTO-UPDATE] loop error: {e}", exc_info=True)
+            time.sleep(300)  # 5 minutes
+
+    def _check_and_apply_updates(self):
+        """Check PS model version; pull deltas or full model if behind."""
+        try:
+            resp = requests.get(f"{self.ps_url}/model/info", timeout=15)
+            if resp.status_code != 200:
+                log.warning(f"[AUTO-UPDATE] /model/info returned {resp.status_code}")
+                return
+            info = resp.json()
+        except Exception as e:
+            log.warning(f"[AUTO-UPDATE] failed to reach PS: {e}")
+            return
+
+        ps_version = info.get("model_version", 0)
+        if ps_version <= self.model_version:
+            return  # Already up to date
+
+        gap = ps_version - self.model_version
+        log.info(f"[AUTO-UPDATE] PS v{ps_version} > local v{self.model_version} (gap={gap})")
+
+        if gap > 10:
+            # Too far behind — full download
+            log.info(f"[AUTO-UPDATE] gap={gap} > 10, downloading full model...")
+            self._download_full_model(ps_version)
+        else:
+            # Incremental delta updates
+            current = self.model_version
+            for v in range(current, ps_version):
+                ok = self._fetch_and_apply_delta(v)
+                if not ok:
+                    log.warning(f"[AUTO-UPDATE] delta from v{v} failed, falling back to full download")
+                    self._download_full_model(ps_version)
+                    return
+            log.info(f"[AUTO-UPDATE] ✅ Incremental update complete → v{self.model_version}")
+
+    def _fetch_and_apply_delta(self, from_version: int) -> bool:
+        """Fetch single delta from PS and apply to model_shapes + streaming_agg."""
         try:
             resp = requests.get(
                 f"{self.ps_url}/model/delta",
-                params={"from_version": self.model_version},
+                params={"from_version": from_version},
                 timeout=120,
             )
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("status") == "ok":
-                    self.model_version = target_version
-                    with self._delta_lock:
-                        self._delta_cache = data
-                    log.info(f"[MODEL] Updated to v{self.model_version}")
-            elif resp.status_code == 304:
-                log.info("[MODEL] Already up to date")
+            if resp.status_code != 200:
+                log.warning(f"[AUTO-UPDATE] delta from v{from_version}: HTTP {resp.status_code}")
+                return False
+
+            delta_payload = resp.json()
         except Exception as e:
-            log.warning(f"[MODEL] delta pull failed: {e}")
+            log.warning(f"[AUTO-UPDATE] delta fetch failed: {e}")
+            return False
+
+        return self._apply_delta(delta_payload, from_version)
+
+    def _apply_delta(self, delta_payload: dict, from_version: int) -> bool:
+        """
+        Apply compressed delta to local model file + update shapes + reset aggregator.
+        
+        Aggregator doesn't hold the full model in memory — it stores model_shapes
+        and a file on disk. We update the file and refresh shapes.
+        """
+        try:
+            import base64 as _b64
+
+            # Decompress delta — binary_v2 format (same as miner)
+            sparse_delta = {}
+            items = []
+            if isinstance(delta_payload, dict):
+                items = [(k, v) for k, v in delta_payload.items()
+                         if isinstance(v, dict) and "k" in v]
+            elif isinstance(delta_payload, list):
+                items = [(item["name"], item) for item in delta_payload]
+
+            for name, data in items:
+                shape = tuple(data["shape"])
+                k = data["k"]
+                raw = zlib.decompress(_b64.b64decode(data["data"]))
+
+                indices_bytes = k * 4
+                values_bytes = len(raw) - indices_bytes
+
+                if values_bytes == k * 2:
+                    values = torch.frombuffer(bytearray(raw[:values_bytes]), dtype=torch.float16).clone()
+                elif values_bytes == k * 4:
+                    values = torch.frombuffer(bytearray(raw[:values_bytes]), dtype=torch.float32).clone()
+                else:
+                    log.warning(f"[AUTO-UPDATE] param {name}: buffer mismatch, skipping")
+                    continue
+
+                indices = torch.frombuffer(
+                    bytearray(raw[values_bytes:]), dtype=torch.int32
+                ).to(torch.int64).clone()
+
+                sparse_delta[name] = {"indices": indices, "values": values, "shape": shape}
+
+            if not sparse_delta:
+                log.warning("[AUTO-UPDATE] Empty delta after decompression")
+                return False
+
+            # Update model file on disk
+            model_path = os.path.join(self.model_dir, "model_current.pt")
+            if os.path.exists(model_path):
+                state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+                updated = 0
+                for name, sdata in sparse_delta.items():
+                    if name in state_dict:
+                        flat = state_dict[name].view(-1)
+                        vals = sdata["values"].to(flat.dtype)
+                        flat[sdata["indices"]] += vals
+                        state_dict[name] = flat.view(sdata["shape"])
+                        updated += 1
+
+                tmp_path = model_path + ".tmp"
+                torch.save(state_dict, tmp_path)
+                os.replace(tmp_path, model_path)
+
+                # Refresh model_shapes from updated state_dict
+                self.model_shapes = {n: tuple(t.shape) for n, t in state_dict.items()}
+                del state_dict
+                gc.collect()
+            else:
+                log.warning("[AUTO-UPDATE] No model file to apply delta to, shapes from delta only")
+                # Update shapes from delta (shapes don't change, but verify consistency)
+                for name, sdata in sparse_delta.items():
+                    self.model_shapes[name] = sdata["shape"]
+
+            # Update version
+            self.model_version = from_version + 1
+
+            # Cache delta for serving to miners
+            with self._delta_lock:
+                self._delta_cache = {"from_version": from_version, **{
+                    n: {"shape": list(s["shape"]), "k": len(s["indices"]),
+                        "indices": s["indices"].tolist(), "values": s["values"].tolist()}
+                    for n, s in sparse_delta.items()
+                }} if len(sparse_delta) < 50 else None  # Only cache small deltas
+
+            # Reset streaming aggregator with updated shapes
+            if self.streaming_agg is not None:
+                self.streaming_agg.reset()
+                log.info("[AUTO-UPDATE] StreamingAggregator reset after delta apply")
+
+            log.info(f"[AUTO-UPDATE] Applied delta v{from_version}→v{self.model_version}")
+            return True
+
+        except Exception as e:
+            log.error(f"[AUTO-UPDATE] _apply_delta failed: {e}", exc_info=True)
+            return False
+
+    def _download_full_model(self, target_version: int):
+        """Download full model from PS, update shapes + aggregator."""
+        model_path = os.path.join(self.model_dir, "model_current.pt")
+        tmp_path = model_path + ".downloading"
+
+        # Get download URL
+        try:
+            info_resp = requests.get(f"{self.ps_url}/model/info", timeout=15)
+            info = info_resp.json() if info_resp.status_code == 200 else {}
+            download_url = info.get("download_url", "")
+            if not download_url:
+                download_url = f"{self.ps_url}/models/v{target_version}_full.pt"
+            elif download_url.startswith("/"):
+                download_url = f"{self.ps_url}{download_url}"
+        except Exception:
+            download_url = f"{self.ps_url}/models/v{target_version}_full.pt"
+
+        log.info(f"[AUTO-UPDATE] Downloading full model v{target_version} from {download_url}")
+
+        try:
+            resp = requests.get(download_url, stream=True, timeout=3600)
+            if resp.status_code != 200:
+                log.error(f"[AUTO-UPDATE] Full model download failed: HTTP {resp.status_code}")
+                return
+
+            os.makedirs(os.path.dirname(model_path) or ".", exist_ok=True)
+            downloaded = 0
+            last_log = 0
+            total = int(resp.headers.get("content-length", 0))
+            with open(tmp_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if downloaded - last_log >= 50 * 1024 * 1024:
+                        if total:
+                            pct = downloaded * 100 / total
+                            log.info(f"[AUTO-UPDATE] Download: {downloaded/1e6:.0f}MB / {total/1e6:.0f}MB ({pct:.1f}%)")
+                        else:
+                            log.info(f"[AUTO-UPDATE] Download: {downloaded/1e6:.0f}MB")
+                        last_log = downloaded
+
+            os.replace(tmp_path, model_path)
+            log.info(f"[AUTO-UPDATE] Downloaded {downloaded/1e6:.1f}MB → {model_path}")
+
+            # Reload shapes from new model
+            state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+            self.model_shapes = {n: tuple(t.shape) for n, t in state_dict.items()}
+            del state_dict
+            gc.collect()
+
+            self.model_version = target_version
+
+            # Reinitialize streaming aggregator
+            if self.model_shapes:
+                self.streaming_agg = StreamingAggregator(
+                    model_shapes=self.model_shapes,
+                    device="cpu",
+                    dtype=torch.float32,
+                )
+                log.info(f"[AUTO-UPDATE] StreamingAggregator re-initialized: {len(self.model_shapes)} params")
+
+            with self._delta_lock:
+                self._delta_cache = None
+
+            log.info(f"[AUTO-UPDATE] ✅ Full model v{target_version} loaded")
+
+        except Exception as e:
+            log.error(f"[AUTO-UPDATE] full download failed: {e}", exc_info=True)
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     # ============================================
     # Initialization
@@ -501,6 +714,10 @@ class AggregatorNode:
 
         # Start miner cleanup loop
         threading.Thread(target=self._miner_cleanup_loop, daemon=True, name="miner_cleanup").start()
+
+        # Start model auto-update loop (checks PS every 5 min for deltas)
+        threading.Thread(target=self._model_update_loop, daemon=True, name="model_update").start()
+        log.info("[INIT] Model auto-update loop started (300s interval)")
 
         log.info("[INIT] ✅ Aggregator node ready")
 
