@@ -518,6 +518,35 @@ class ScoringServer:
     # Background model auto-update (delta / full download from PS)
     # ================================================================
 
+
+    def _ensure_ps_token(self):
+        """Register with PS to get auth token for delta requests."""
+        if hasattr(self, '_ps_token') and self._ps_token:
+            return self._ps_token
+        import requests as _requests
+        try:
+            resp = _requests.post(
+                f"{self.ps_url}/register",
+                json={
+                    "address": f"scorer-{id(self):x}",
+                    "instance_id": f"scorer-{id(self):x}",
+                    "protocol_version": "1.0",
+                    "data_format": "tensor",
+                    "device_type": "cpu",
+                    "memory_gb": 64,
+                },
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                self._ps_token = resp.json().get("token", "")
+                if self._ps_token:
+                    log.info("[AUTO-UPDATE] Got PS auth token")
+                    return self._ps_token
+        except Exception as e:
+            log.warning(f"[AUTO-UPDATE] Failed to get PS token: {e}")
+        self._ps_token = None
+        return None
+
     def _model_update_loop(self):
         """Background thread: check PS for model updates every 300s."""
         time.sleep(30)  # Initial delay — let server start up
@@ -569,9 +598,14 @@ class ScoringServer:
         import requests as _requests
 
         try:
+            headers = {}
+            token = self._ensure_ps_token()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
             resp = _requests.get(
                 f"{self.ps_url}/model/delta",
                 params={"from_version": from_version},
+                headers=headers,
                 timeout=120,
             )
             if resp.status_code != 200:

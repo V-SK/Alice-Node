@@ -223,9 +223,14 @@ class AggregatorNode:
 
         # Proxy to PS for delta
         try:
+            headers = {}
+            token = self._ensure_ps_token()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
             resp = requests.get(
                 f"{self.ps_url}/model/delta",
                 params={"from_version": from_version},
+                headers=headers,
                 timeout=120,
             )
             if resp.status_code == 200:
@@ -394,6 +399,34 @@ class AggregatorNode:
     # Background model auto-update (delta / full)
     # ============================================
 
+
+    def _ensure_ps_token(self):
+        """Register with PS to get auth token for delta requests."""
+        if hasattr(self, '_ps_token') and self._ps_token:
+            return self._ps_token
+        try:
+            resp = requests.post(
+                f"{self.ps_url}/register",
+                json={
+                    "address": f"agg-{self.node_id}",
+                    "instance_id": f"agg-{self.node_id}",
+                    "protocol_version": "1.0",
+                    "data_format": "tensor",
+                    "device_type": "cpu",
+                    "memory_gb": 64,
+                },
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                self._ps_token = resp.json().get("token", "")
+                if self._ps_token:
+                    log.info("[AUTO-UPDATE] Got PS auth token")
+                    return self._ps_token
+        except Exception as e:
+            log.warning(f"[AUTO-UPDATE] Failed to get PS token: {e}")
+        self._ps_token = None
+        return None
+
     def _model_update_loop(self):
         """Background thread: check PS for model updates every 300s."""
         time.sleep(60)  # Initial delay — let epoch sync init first
@@ -441,9 +474,14 @@ class AggregatorNode:
     def _fetch_and_apply_delta(self, from_version: int) -> bool:
         """Fetch single delta from PS and apply to model_shapes + streaming_agg."""
         try:
+            headers = {}
+            token = self._ensure_ps_token()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
             resp = requests.get(
                 f"{self.ps_url}/model/delta",
                 params={"from_version": from_version},
+                headers=headers,
                 timeout=120,
             )
             if resp.status_code != 200:
