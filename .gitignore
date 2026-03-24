@@ -1,18 +1,32 @@
-__pycache__/
-*.pyc
-*.pyo
-.env*
-*.pt
-*.bin
-logs/
-models/
-data/
-.alice/
-wallet.json
-*.bak
-*.bak.*
-venv/
-.venv/
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
 dist/
-build/
-*.egg-info/
+src-tauri/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# Tauri
+src-tauri/target/
+
+# Test
+coverage/
