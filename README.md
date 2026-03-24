@@ -39,7 +39,7 @@ Run an aggregator node — collect, aggregate miner gradients and forward to the
 python alice_node.py aggregate --ps-url https://ps.aliceprotocol.org
 ```
 
-**Requirements:** 16GB+ RAM, high-speed network, stake 10,000 ALICE
+**Requirements:** 64GB+ RAM, 1TB SSD, high-speed network, stake 20,000 ALICE
 
 ## Quick Start
 
@@ -79,7 +79,7 @@ python alice_node.py mine
 |------|----------|------------|------|---------|-------------|
 | **Miner** | 24 GB+ | 16 GB | 20 GB | 10 Mbps | — |
 | **Scorer** | Optional | 32 GB+ | 20 GB | 50 Mbps | 5,000 |
-| **Aggregator** | — | 16 GB+ | 50 GB | 100 Mbps | 10,000 |
+| **Aggregator** | — | 64 GB+ | 1 TB | 500 Mbps | 20,000 |
 
 ## Rewards
 
