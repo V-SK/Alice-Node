@@ -123,7 +123,7 @@ export default function Setup({ onComplete }: SetupProps) {
     try {
       const wallet = await invoke("generate_wallet");
       setWalletAddress(wallet.address);
-      setMnemonic(wallet.mnemonic);
+      setMnemonic(wallet.mnemonic || "");
       setShowMnemonic(true);
     } catch (e: any) {
       setError(e.toString());

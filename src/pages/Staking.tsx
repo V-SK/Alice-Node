@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
+import type { StakingInfo } from "../types/tauri";
 import { useAppStore } from "../hooks/useAppStore";
 
 const STAKE_AMOUNTS: Record<string, number> = {
@@ -9,11 +10,7 @@ const STAKE_AMOUNTS: Record<string, number> = {
 
 export default function Staking() {
   const { role } = useAppStore();
-  const [stakingInfo, setStakingInfo] = useState<{
-    staked: number;
-    status: string;
-    role: string | null;
-  }>({ staked: 0, status: "None", role: null });
+  const [stakingInfo, setStakingInfo] = useState<StakingInfo>({ staked: 0, status: "None", role: null });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
