@@ -209,9 +209,8 @@ fn auto_restart_miner(
     let restart_delay = std::time::Duration::from_secs(10);
 
     // Helper to lock the managed state
-    let lock_state = || -> Result<std::sync::MutexGuard<'_, MiningProcess>, ()> {
-        let state_ref: State<'_, MiningProcessState> = app_handle.state();
-        state_ref.lock().map_err(|_| ())
+    let lock_state = || -> Result<std::sync::MutexGuard<MiningProcess>, ()> {
+        app_handle.state::<MiningProcessState>().inner().lock().map_err(|_| ())
     };
 
     // Wait for the initial process to finish
