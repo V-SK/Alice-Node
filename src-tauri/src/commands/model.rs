@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::io::AsyncWriteExt;
 
 const DL_URL: &str = "https://dl.aliceprotocol.org";
+const MAX_FILE_SIZE: u64 = 20 * 1024 * 1024 * 1024; // 20 GB
 
 /// Concurrency guard: only one download at a time
 static DOWNLOADING: AtomicBool = AtomicBool::new(false);
@@ -190,34 +191,74 @@ async fn download_model_inner(_variant: ModelVariant) -> Result<(), String> {
         ));
     }
 
-    let total_size = response.content_length().unwrap_or(0) + existing_size;
-    DOWNLOAD_TOTAL.store(total_size, Ordering::SeqCst);
-    DOWNLOAD_PROGRESS.store(existing_size, Ordering::SeqCst);
+    // #12: If we requested a Range but got 200 (not 206), server ignored Range header
+    let server_ignored_range = existing_size > 0 && response.status() == reqwest::StatusCode::OK;
+    if server_ignored_range {
+        log::warn!("Server ignored Range header, restarting download from scratch");
+        // Truncate the file and start over
+        let _ = std::fs::remove_file(&temp_path);
+    }
 
-    // Open file for appending
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&temp_path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let content_length = response.content_length().unwrap_or(0);
+    let base_offset = if server_ignored_range { 0 } else { existing_size };
+    let total_size = content_length + base_offset;
+
+    // #12: Enforce max file size limit (20 GB)
+    if total_size > MAX_FILE_SIZE {
+        return Err(format!(
+            "File size {} bytes exceeds maximum allowed {} bytes (20 GB)",
+            total_size, MAX_FILE_SIZE
+        ));
+    }
+
+    DOWNLOAD_TOTAL.store(total_size, Ordering::SeqCst);
+    DOWNLOAD_PROGRESS.store(base_offset, Ordering::SeqCst);
+
+    // Open file: truncate if server ignored range, append otherwise
+    let mut file = if server_ignored_range {
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&temp_path)
+            .await
+            .map_err(|e| e.to_string())?
+    };
 
     let mut stream = response.bytes_stream();
-    let mut downloaded = existing_size;
+    let mut downloaded = base_offset;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| e.to_string())?;
-        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
         downloaded += chunk.len() as u64;
+
+        // Enforce size limit during download
+        if downloaded > MAX_FILE_SIZE {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(format!(
+                "Download exceeded maximum file size of {} bytes (20 GB)",
+                MAX_FILE_SIZE
+            ));
+        }
+
+        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
         DOWNLOAD_PROGRESS.store(downloaded, Ordering::SeqCst);
     }
 
     file.flush().await.map_err(|e| e.to_string())?;
     drop(file);
 
-    // Verify checksum
+    // #11: Verify checksum — strict mode
     let checksum_url = format!("{}/v{}_full.pt.sha256", DL_URL, latest_version);
     log::info!("Fetching checksum from: {}", checksum_url);
+    let mut verified = false;
     match client.get(&checksum_url).send().await {
         Ok(resp) if resp.status().is_success() => {
             let expected_hash = resp
@@ -238,27 +279,35 @@ async fn download_model_inner(_variant: ModelVariant) -> Result<(), String> {
                 let actual_hash = format!("{:x}", hasher.finalize());
 
                 if actual_hash != expected_hash {
+                    // Checksum exists but doesn't match — MUST delete and error
                     let _ = std::fs::remove_file(&temp_path);
                     return Err(format!(
-                        "Checksum mismatch: expected {}, got {}. File deleted.",
+                        "Checksum mismatch: expected {}, got {}. Corrupted file deleted.",
                         expected_hash, actual_hash
                     ));
                 }
                 log::info!("Checksum verified OK");
+                verified = true;
             }
         }
         Ok(resp) => {
+            // Checksum file not available — warn but allow model to be used
             log::warn!(
-                "Checksum file not available (HTTP {}), skipping verification",
+                "Checksum file not available (HTTP {}), model usable but unverified",
                 resp.status()
             );
         }
         Err(e) => {
+            // Network error fetching checksum — warn but allow model to be used
             log::warn!(
-                "Could not fetch checksum: {}, skipping verification",
+                "Could not fetch checksum: {}, model usable but unverified",
                 e
             );
         }
+    }
+
+    if !verified {
+        log::warn!("Model downloaded but checksum could not be verified (verified=false)");
     }
 
     // Rename temp to final

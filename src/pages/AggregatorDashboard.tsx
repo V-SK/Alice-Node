@@ -15,7 +15,7 @@ export default function AggregatorDashboard() {
   useEffect(() => {
     const poll = async () => {
       try {
-        const status = await invoke<any>("get_aggregating_status");
+        const status = await invoke("get_aggregating_status");
         setAggregatingState(status);
       } catch (e) {
         console.error("Failed to get aggregating status:", e);

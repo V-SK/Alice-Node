@@ -5,6 +5,7 @@ pub mod model;
 pub mod network;
 pub mod role;
 pub mod scoring;
+pub mod settings;
 pub mod setup;
 pub mod staking;
 pub mod wallet;

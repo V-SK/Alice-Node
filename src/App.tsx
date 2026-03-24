@@ -23,8 +23,8 @@ function App() {
   useEffect(() => {
     const checkSetup = async () => {
       try {
-        const address = await invoke<string | null>("get_wallet_address");
-        const savedRole = await invoke<string | null>("get_role");
+        const address = await invoke("get_wallet_address");
+        const savedRole = await invoke("get_role");
         if (address && savedRole) {
           setWalletAddress(address);
           setRole(savedRole as any);
@@ -40,7 +40,7 @@ function App() {
 
     const checkNetwork = async () => {
       try {
-        const status = await invoke<any>("diagnose_network");
+        const status = await invoke("diagnose_network");
         setNetworkStatus(status);
       } catch (e) {
         console.error("Network check failed:", e);
@@ -49,7 +49,7 @@ function App() {
 
     const checkGpu = async () => {
       try {
-        const gpus = await invoke<any[]>("detect_gpu");
+        const gpus = await invoke("detect_gpu");
         setGpuInfo(gpus);
       } catch (e) {
         console.error("GPU check failed:", e);

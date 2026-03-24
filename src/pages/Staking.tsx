@@ -22,7 +22,7 @@ export default function Staking() {
 
   const fetchInfo = async () => {
     try {
-      const info = await invoke<any>("get_staking_info");
+      const info = await invoke("get_staking_info");
       setStakingInfo(info);
     } catch (e) {
       console.error("Failed to get staking info:", e);

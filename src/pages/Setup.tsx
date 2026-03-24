@@ -39,7 +39,7 @@ export default function Setup({ onComplete }: SetupProps) {
     setLoading(true);
     setError(null);
     try {
-      const status = await invoke<any>("diagnose_network");
+      const status = await invoke("diagnose_network");
       setNetworkStatus(status);
       setNetworkOk(status.ps_reachable && status.websocket_ok);
       if (status.ps_reachable) {
@@ -56,7 +56,7 @@ export default function Setup({ onComplete }: SetupProps) {
   const checkGpu = async () => {
     setLoading(true);
     try {
-      const detected = await invoke<any[]>("detect_gpu");
+      const detected = await invoke("detect_gpu");
       setGpus(detected);
       const supported = detected.find((g) => g.is_supported);
       if (supported) {
@@ -81,7 +81,7 @@ export default function Setup({ onComplete }: SetupProps) {
     setDownloadStatus("Starting download...");
     try {
       // Check current status
-      const status = await invoke<any>("check_model_status");
+      const status = await invoke("check_model_status");
       if (status.int8_available || status.fp16_available) {
         setDownloadStatus("Model already downloaded");
         setDownloadProgress(100);
@@ -94,7 +94,7 @@ export default function Setup({ onComplete }: SetupProps) {
       
       // Poll progress
       const pollProgress = async () => {
-        const progress = await invoke<any>("get_download_progress");
+        const progress = await invoke("get_download_progress");
         if (progress) {
           setDownloadProgress(progress.percent);
           setDownloadStatus(
@@ -121,7 +121,7 @@ export default function Setup({ onComplete }: SetupProps) {
   const createWallet = async () => {
     setLoading(true);
     try {
-      const wallet = await invoke<any>("generate_wallet");
+      const wallet = await invoke("generate_wallet");
       setWalletAddress(wallet.address);
       setMnemonic(wallet.mnemonic);
       setShowMnemonic(true);
@@ -135,7 +135,7 @@ export default function Setup({ onComplete }: SetupProps) {
   const importWallet = async () => {
     setLoading(true);
     try {
-      const wallet = await invoke<any>("import_wallet", {
+      const wallet = await invoke("import_wallet", {
         mnemonic: importMnemonic.trim(),
       });
       setWalletAddress(wallet.address);

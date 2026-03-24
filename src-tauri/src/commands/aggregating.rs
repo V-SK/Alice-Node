@@ -106,9 +106,10 @@ pub fn start_aggregating(
     process.state.status = AggregatingStatus::Starting;
     process.state.wallet_address = Some(wallet_address.clone());
 
+    let ps_url = super::settings::load_ps_url();
     let (program, mut args) = get_aggregator_command();
     args.extend(["--address".to_string(), wallet_address.clone()]);
-    args.extend(["--ps-url".to_string(), "https://ps.aliceprotocol.org".to_string()]);
+    args.extend(["--ps-url".to_string(), ps_url]);
 
     let mut cmd = Command::new(&program);
     for arg in &args {
@@ -172,28 +173,56 @@ pub fn stop_aggregating(state: State<'_, AggregatingProcessState>) -> Result<(),
     process.state.status = AggregatingStatus::Stopping;
 
     if let Some(ref mut child) = process.child {
-        #[cfg(unix)]
-        {
-            unsafe {
-                libc::kill(child.id() as i32, libc::SIGTERM);
-            }
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
-
-        match child.try_wait() {
-            Ok(Some(_)) => {}
-            _ => {
-                let _ = child.kill();
-            }
-        }
-
-        let _ = child.wait();
+        graceful_kill_aggregator(child);
     }
 
     process.child = None;
     process.state.status = AggregatingStatus::Idle;
     log::info!("Aggregating stopped");
     Ok(())
+}
+
+/// Cross-platform graceful process termination for aggregator.
+fn graceful_kill_aggregator(child: &mut Child) {
+    let pid = child.id();
+
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if let Ok(Some(_)) = child.try_wait() {
+                return;
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string()])
+            .output();
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if let Ok(Some(_)) = child.try_wait() {
+                return;
+            }
+        }
+        log::warn!("Aggregator process {} did not exit gracefully, force killing", pid);
+        let _ = Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .output();
+    }
+
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        _ => {
+            let _ = child.kill();
+        }
+    }
+    let _ = child.wait();
 }
 
 #[tauri::command]

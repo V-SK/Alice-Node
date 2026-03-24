@@ -19,7 +19,7 @@ export default function Dashboard() {
   useEffect(() => {
     const poll = async () => {
       try {
-        const status = await invoke<any>("get_mining_status");
+        const status = await invoke("get_mining_status");
         setMiningState(status);
         
         // Update loss if available

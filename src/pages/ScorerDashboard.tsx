@@ -15,7 +15,7 @@ export default function ScorerDashboard() {
   useEffect(() => {
     const poll = async () => {
       try {
-        const status = await invoke<any>("get_scoring_status");
+        const status = await invoke("get_scoring_status");
         setScoringState(status);
       } catch (e) {
         console.error("Failed to get scoring status:", e);

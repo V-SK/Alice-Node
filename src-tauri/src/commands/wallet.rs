@@ -5,6 +5,13 @@ const ALICE_SS58_PREFIX: u16 = 300;
 const KEYRING_SERVICE: &str = "alice-miner";
 const KEYRING_USER: &str = "wallet_address";
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalanceInfo {
+    pub free: f64,
+    pub reserved: f64,
+    pub staked: f64,
+}
+
 // SECURITY NOTE: This module only stores the wallet ADDRESS (public key derivative)
 // in the system keychain. No private keys or mnemonics are ever persisted.
 // The mnemonic is generated in-memory and returned to the frontend exactly once
@@ -105,5 +112,24 @@ pub fn clear_wallet() -> Result<(), String> {
         Ok(_) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()), // Already cleared
         Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn get_balance(address: String) -> Result<BalanceInfo, String> {
+    let url = format!("https://ps.aliceprotocol.org/balance/{}", address);
+    let resp = reqwest::get(&url).await;
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            r.json::<BalanceInfo>().await.map_err(|e| e.to_string())
+        }
+        _ => {
+            // PS may not have this endpoint yet, return defaults
+            Ok(BalanceInfo {
+                free: 0.0,
+                reserved: 0.0,
+                staked: 0.0,
+            })
+        }
     }
 }

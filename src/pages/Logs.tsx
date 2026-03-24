@@ -1,19 +1,33 @@
 import { useEffect } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { useAppStore } from "../hooks/useAppStore";
 
 export default function Logs() {
-  const { logs, clearLogs, startMinerLogListener } = useAppStore();
+  const { logs, clearLogs, addLog } = useAppStore();
 
-  // Subscribe to miner log events from the Rust backend
+  // Subscribe to all role log events from the Rust backend
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    startMinerLogListener().then((fn) => {
-      unlisten = fn;
-    });
+    const unlisteners = [
+      listen<{ type: string; message: string }>("miner-log", (e) => {
+        const logType = e.payload.type === "stderr" ? "error" : "miner";
+        addLog(e.payload.message, logType);
+      }),
+      listen<{ type: string; message: string }>("scorer-log", (e) => {
+        const logType = e.payload.type === "stderr" ? "error" : "scorer";
+        addLog(e.payload.message, logType);
+      }),
+      listen<{ type: string; message: string }>("aggregator-log", (e) => {
+        const logType = e.payload.type === "stderr" ? "error" : "aggregator";
+        addLog(e.payload.message, logType);
+      }),
+      listen("setup-progress", (e) => {
+        addLog(JSON.stringify(e.payload), "system");
+      }),
+    ];
     return () => {
-      if (unlisten) unlisten();
+      unlisteners.forEach((p) => p.then((f) => f()));
     };
-  }, [startMinerLogListener]);
+  }, [addLog]);
 
   const copyLogs = () => {
     const text = logs.map((l) => `[${l.time}] ${l.msg}`).join("\n");

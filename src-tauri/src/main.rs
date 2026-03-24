@@ -79,6 +79,7 @@ fn main() {
             commands::wallet::save_wallet_address,
             commands::wallet::get_wallet_address,
             commands::wallet::clear_wallet,
+            commands::wallet::get_balance,
             // Mining
             commands::mining::start_mining,
             commands::mining::stop_mining,
@@ -103,6 +104,9 @@ fn main() {
             commands::staking::stake,
             commands::staking::unstake,
             commands::staking::get_staking_info,
+            // Settings
+            commands::settings::save_settings,
+            commands::settings::load_settings,
             // Setup
             commands::setup::auto_setup,
         ])
