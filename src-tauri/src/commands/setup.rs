@@ -6,7 +6,7 @@ use tauri::Manager;
 const ALICE_MINER_DIR: &str = ".alice-miner";
 const VENV_DIR: &str = ".venv";
 const CODE_DIR: &str = "alice-node";
-const REPO_URL: &str = "https://github.com/aliceprotocol/alice-node.git";
+const REPO_URL: &str = "https://github.com/V-SK/Alice-Node.git";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetupResult {
