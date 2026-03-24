@@ -11,8 +11,8 @@ static DOWNLOADING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum ModelVariant {
-    Int8,  // Quantized ~7GB, for quick start
-    Fp16,  // Full ~13GB, for production training
+    Int8,  // Legacy alias — maps to latest model
+    Fp16,  // Legacy alias — maps to latest model
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +22,7 @@ pub struct ModelStatus {
     pub int8_size_gb: f64,
     pub fp16_size_gb: f64,
     pub active_variant: Option<ModelVariant>,
+    pub model_version: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,54 +45,61 @@ fn get_model_dir() -> std::path::PathBuf {
     model_dir
 }
 
-fn get_model_path(variant: ModelVariant) -> std::path::PathBuf {
-    let filename = match variant {
-        ModelVariant::Int8 => "model_int8.pt",
-        ModelVariant::Fp16 => "model_fp16.pt",
-    };
-    get_model_dir().join(filename)
+fn get_model_path(_variant: ModelVariant) -> std::path::PathBuf {
+    get_model_dir().join("model_current.pt")
+}
+
+fn get_version_path() -> std::path::PathBuf {
+    get_model_dir().join("version.txt")
+}
+
+fn read_local_version() -> Option<u32> {
+    let path = get_version_path();
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+fn write_local_version(version: u32) {
+    let path = get_version_path();
+    std::fs::write(&path, version.to_string()).ok();
+}
+
+/// Fetch the latest model version from the server
+async fn fetch_latest_version(client: &reqwest::Client) -> Result<u32, String> {
+    let url = format!("{}/latest_version.txt", DL_URL);
+    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("Failed to fetch latest version: HTTP {}", resp.status()));
+    }
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    text.trim()
+        .parse::<u32>()
+        .map_err(|e| format!("Invalid version number: {}", e))
 }
 
 #[tauri::command]
 pub fn check_model_status() -> Result<ModelStatus, String> {
-    let model_dir = get_model_dir();
+    let model_path = get_model_dir().join("model_current.pt");
+    let available = model_path.exists();
 
-    let int8_path = model_dir.join("model_int8.pt");
-    let fp16_path = model_dir.join("model_fp16.pt");
-
-    let int8_available = int8_path.exists();
-    let fp16_available = fp16_path.exists();
-
-    let int8_size_gb = if int8_available {
-        std::fs::metadata(&int8_path)
+    let size_gb = if available {
+        std::fs::metadata(&model_path)
             .map(|m| m.len() as f64 / 1e9)
             .unwrap_or(0.0)
     } else {
         0.0
     };
 
-    let fp16_size_gb = if fp16_available {
-        std::fs::metadata(&fp16_path)
-            .map(|m| m.len() as f64 / 1e9)
-            .unwrap_or(0.0)
-    } else {
-        0.0
-    };
-
-    let active_variant = if fp16_available {
-        Some(ModelVariant::Fp16)
-    } else if int8_available {
-        Some(ModelVariant::Int8)
-    } else {
-        None
-    };
+    let model_version = read_local_version();
 
     Ok(ModelStatus {
-        int8_available,
-        fp16_available,
-        int8_size_gb,
-        fp16_size_gb,
-        active_variant,
+        int8_available: available,
+        fp16_available: available,
+        int8_size_gb: size_gb,
+        fp16_size_gb: size_gb,
+        active_variant: if available { Some(ModelVariant::Fp16) } else { None },
+        model_version,
     })
 }
 
@@ -108,22 +116,52 @@ pub async fn download_model(variant: ModelVariant) -> Result<(), String> {
     result
 }
 
-async fn download_model_inner(variant: ModelVariant) -> Result<(), String> {
-    let filename = match variant {
-        ModelVariant::Int8 => "model_int8.pt",
-        ModelVariant::Fp16 => "model_fp16.pt",
-    };
+async fn download_model_inner(_variant: ModelVariant) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(7200)) // 2 hour timeout for 13GB
+        .build()
+        .map_err(|e| e.to_string())?;
 
+    // 1. Fetch latest version
+    let latest_version = fetch_latest_version(&client).await?;
+    let local_version = read_local_version();
+
+    log::info!(
+        "Model version: latest=v{}, local={:?}",
+        latest_version,
+        local_version
+    );
+
+    // If already up to date, skip download
+    let model_path = get_model_dir().join("model_current.pt");
+    if let Some(local_v) = local_version {
+        if local_v >= latest_version && model_path.exists() {
+            log::info!("Model already up to date (v{})", local_v);
+            return Ok(());
+        }
+    }
+
+    // 2. Try delta update first (much smaller)
+    if let Some(local_v) = local_version {
+        if local_v + 1 == latest_version {
+            let delta_url = format!("{}/v{}_delta.pt.zstd", DL_URL, latest_version);
+            log::info!("Attempting delta update: {}", delta_url);
+            let resp = client.head(&delta_url).send().await;
+            if let Ok(r) = resp {
+                if r.status().is_success() {
+                    log::info!("Delta available, but full download is more reliable for GUI. Skipping delta.");
+                    // TODO: implement delta apply (zstd decompress + merge)
+                }
+            }
+        }
+    }
+
+    // 3. Full download: v{N}_full.pt
+    let filename = format!("v{}_full.pt", latest_version);
     let url = format!("{}/{}", DL_URL, filename);
-    let model_path = get_model_path(variant);
     let temp_path = model_path.with_extension("pt.tmp");
 
     log::info!("Starting download: {} -> {:?}", url, model_path);
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3600)) // 1 hour timeout
-        .build()
-        .map_err(|e| e.to_string())?;
 
     // Check for existing partial download
     let existing_size = if temp_path.exists() {
@@ -145,7 +183,11 @@ async fn download_model_inner(variant: ModelVariant) -> Result<(), String> {
 
     if !response.status().is_success() && response.status() != reqwest::StatusCode::PARTIAL_CONTENT
     {
-        return Err(format!("Download failed: HTTP {}", response.status()));
+        return Err(format!(
+            "Download failed: HTTP {} for {}",
+            response.status(),
+            url
+        ));
     }
 
     let total_size = response.content_length().unwrap_or(0) + existing_size;
@@ -174,11 +216,13 @@ async fn download_model_inner(variant: ModelVariant) -> Result<(), String> {
     drop(file);
 
     // Verify checksum
-    let checksum_url = format!("{}/{}.sha256", DL_URL, filename);
+    let checksum_url = format!("{}/v{}_full.pt.sha256", DL_URL, latest_version);
     log::info!("Fetching checksum from: {}", checksum_url);
     match client.get(&checksum_url).send().await {
         Ok(resp) if resp.status().is_success() => {
-            let expected_hash = resp.text().await
+            let expected_hash = resp
+                .text()
+                .await
                 .map_err(|e| e.to_string())?
                 .trim()
                 .split_whitespace()
@@ -187,7 +231,6 @@ async fn download_model_inner(variant: ModelVariant) -> Result<(), String> {
                 .to_lowercase();
 
             if !expected_hash.is_empty() {
-                // Compute SHA-256 of the downloaded file
                 log::info!("Verifying checksum...");
                 let file_bytes = std::fs::read(&temp_path).map_err(|e| e.to_string())?;
                 let mut hasher = Sha256::new();
@@ -195,7 +238,6 @@ async fn download_model_inner(variant: ModelVariant) -> Result<(), String> {
                 let actual_hash = format!("{:x}", hasher.finalize());
 
                 if actual_hash != expected_hash {
-                    // Delete corrupt file
                     let _ = std::fs::remove_file(&temp_path);
                     return Err(format!(
                         "Checksum mismatch: expected {}, got {}. File deleted.",
@@ -206,16 +248,30 @@ async fn download_model_inner(variant: ModelVariant) -> Result<(), String> {
             }
         }
         Ok(resp) => {
-            log::warn!("Checksum file not available (HTTP {}), skipping verification", resp.status());
+            log::warn!(
+                "Checksum file not available (HTTP {}), skipping verification",
+                resp.status()
+            );
         }
         Err(e) => {
-            log::warn!("Could not fetch checksum: {}, skipping verification", e);
+            log::warn!(
+                "Could not fetch checksum: {}, skipping verification",
+                e
+            );
         }
     }
 
+    // Rename temp to final
     std::fs::rename(&temp_path, &model_path).map_err(|e| e.to_string())?;
 
-    log::info!("Download complete: {:?}", model_path);
+    // Write version file
+    write_local_version(latest_version);
+
+    log::info!(
+        "Download complete: v{} -> {:?}",
+        latest_version,
+        model_path
+    );
     Ok(())
 }
 
@@ -231,7 +287,7 @@ pub fn get_download_progress() -> Result<Option<DownloadProgress>, String> {
     let percent = (downloaded as f64 / total as f64) * 100.0;
 
     Ok(Some(DownloadProgress {
-        variant: ModelVariant::Int8, // TODO: track actual variant
+        variant: ModelVariant::Fp16,
         downloaded_bytes: downloaded,
         total_bytes: total,
         percent,
