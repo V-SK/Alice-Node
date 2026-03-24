@@ -834,8 +834,8 @@ def detect_device() -> str:
         return env_device
     if torch.cuda.is_available():
         return "cuda"
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return "mps"
+    # MPS is slower than CPU for validation workloads on Apple Silicon;
+    # skip auto-detection of MPS, users can still force with --device mps
     return "cpu"
 
 
