@@ -7,7 +7,11 @@ Requests tasks from PS, downloads shards on-demand, trains assigned layers, and 
 import argparse
 import base64
 import contextlib
-import fcntl
+import sys
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # Windows
 import hashlib
 import json
 import logging
@@ -16,6 +20,7 @@ import os
 import platform
 import subprocess
 import tempfile
+import threading
 import time
 import zlib
 from pathlib import Path
@@ -319,7 +324,11 @@ def acquire_single_instance_lock() -> Any:
     PIDFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
     lock_fp = PIDFILE_PATH.open("w", encoding="utf-8")
     try:
-        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if fcntl:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            import msvcrt
+            msvcrt.locking(lock_fp.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError:
         print("❌ Another miner instance is already running. Exiting.")
         sys.exit(1)
@@ -491,24 +500,31 @@ def topk_compress(
     small_tensor_threshold: int = 10000,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Compress gradient via random sparsification. O(k) instead of O(n log k).
+    Compress a single gradient tensor with TopKCompressor and return (indices, values).
     """
-    n = grad.numel()
-    if n == 0:
+    if grad.numel() == 0:
         return np.empty((0,), dtype=np.int32), np.empty((0,), dtype=np.float32)
 
-    effective_ratio = 1.0 if n < small_tensor_threshold else ratio
-    k = max(1, int(n * effective_ratio))
+    effective_ratio = 1.0 if grad.numel() < small_tensor_threshold else ratio
+    compressor = TopKCompressor(ratio=effective_ratio, error_feedback=False)
+    payload = compressor.compress({"grad": grad.to(torch.float32, copy=False)})
+    packed = payload["grad"]
+    k = int(packed["k"])
 
-    flat = grad.flatten().to(torch.float32, copy=False)
-    if effective_ratio >= 1.0:
-        indices_np = np.arange(n, dtype=np.int32)
-        values_np = flat.detach().cpu().numpy().astype(np.float32, copy=True)
+    raw = zlib.decompress(base64.b64decode(packed["data"]))
+    indices_size = k * 4
+    values_size = len(raw) - indices_size
+    bytes_per_value = (values_size // k) if k > 0 else 0
+
+    if bytes_per_value == 2:
+        value_dtype = np.float16
+    elif bytes_per_value == 4:
+        value_dtype = np.float32
     else:
-        idx = torch.randint(0, n, (k,), device=flat.device)
-        idx = torch.unique(idx)
-        values_np = flat[idx].detach().cpu().numpy().astype(np.float32, copy=True)
-        indices_np = idx.detach().cpu().numpy().astype(np.int32, copy=True)
+        raise ValueError(f"Unknown TopK value dtype width: {bytes_per_value} bytes")
+
+    values_np = np.frombuffer(raw[:values_size], dtype=value_dtype).astype(np.float32, copy=True)
+    indices_np = np.frombuffer(raw[values_size:], dtype=np.int32).astype(np.int32, copy=True)
     return indices_np, values_np
 
 
@@ -565,27 +581,35 @@ def register_compression_hooks(
             if grad_scale != 1.0:
                 work_grad = work_grad * float(grad_scale)
 
-            # GPU-side random sparsification: only move 0.1% to CPU
-            n = work_grad.numel()
-            flat = work_grad.flatten()
-            effective_ratio = 1.0 if n < small_tensor_threshold else ratio
-            k = max(1, int(n * effective_ratio))
-            if effective_ratio >= 1.0:
-                idx = torch.arange(n, device=flat.device)
-            else:
-                idx = torch.randint(0, n, (k,), device=flat.device)
-                idx = torch.unique(idx)
-            values_np = flat[idx].to(dtype=torch.float32).detach().cpu().numpy().astype(np.float32, copy=True)
-            indices_np = idx.detach().cpu().numpy().astype(np.int32, copy=True)
-            del flat, idx
+            cpu_grad = work_grad.detach().to(device="cpu", dtype=torch.float32)
+            if use_error_feedback and residuals is not None:
+                residual = residuals.get(_name)
+                if residual is not None:
+                    cpu_grad = cpu_grad + residual.to(device="cpu", dtype=torch.float32)
 
-            meta["raw_bytes"] += int(n) * 4  # overwrite with correct estimate
+            indices_np, values_np = topk_compress(
+                cpu_grad,
+                ratio=ratio,
+                small_tensor_threshold=small_tensor_threshold,
+            )
+
+            if use_error_feedback and residuals is not None:
+                sent_dense = torch.zeros(cpu_grad.numel(), dtype=torch.float32, device="cpu")
+                if indices_np.size > 0:
+                    idx_t = torch.from_numpy(indices_np).to(dtype=torch.long)
+                    val_t = torch.from_numpy(values_np).to(dtype=torch.float32)
+                    sent_dense[idx_t] = val_t
+                new_residual = (cpu_grad.flatten() - sent_dense).view_as(cpu_grad).to(dtype=EF_DTYPE, device="cpu")
+                residuals[_name] = new_residual
+
+            layer_name = _name.split(".")[2] if _name.startswith("model.layers.") and len(_name.split(".")) > 2 else (_name.split(".")[1] if _name.startswith("layers.") and len(_name.split(".")) > 1 else _name)
+            print(f"[EF_SEND] enabled={int(use_error_feedback)} layer={layer_name} sent_nnz={int(indices_np.size)}")
 
             bucket = compressed_grads.get(_name)
             if bucket is None:
                 bucket = {
-                    "shape": list(work_grad.shape),
-                    "numel": int(n),
+                    "shape": list(cpu_grad.shape),
+                    "numel": int(cpu_grad.numel()),
                     "indices": [],
                     "values": [],
                 }
@@ -893,6 +917,7 @@ def request_delta_update(ps_url: str, from_version: int, auth_token: Optional[st
 def download_model_streaming(ps_url: str, save_path: Path, auth_token: Optional[str] = None) -> bool:
     """Download model using streaming to avoid memory spikes."""
     print("📥 Downloading model (streaming)...")
+    tmp_path = None
     
     try:
         with requests.get(
@@ -927,6 +952,13 @@ def download_model_streaming(ps_url: str, save_path: Path, auth_token: Optional[
         
     except Exception as e:
         print(f"❌ Model download failed: {e}")
+        # Clean up temp file on failure to prevent disk leaks
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+                print(f"🧹 Cleaned up temp file: {tmp_path}")
+            except OSError:
+                pass
         return False
 
 
@@ -1397,8 +1429,9 @@ def train_shard(
     raw_bytes_total = 0
     bad_param: Optional[str] = None
     sparse_parts: Dict[str, Dict[str, Any]] = {}
-    # EF residuals are lazily initialized on CPU inside hooks to avoid GPU OOM.
     ef_residuals: Dict[str, torch.Tensor] = {}
+    if USE_ERROR_FEEDBACK:
+        print("INFO: EF enabled, residual buffers use lazy CPU allocation")
 
     while start_idx < num_sequences:
         # Create batch
@@ -1617,12 +1650,70 @@ def submit_gradient(
     return False
 
 
+def _cleanup_stale_temp_files():
+    """Remove leftover .pt temp files from /tmp and .tmp model caches on startup."""
+    cleaned = 0
+
+    # 1. /tmp/*.pt — leaked by download_model_streaming (NamedTemporaryFile)
+    tmp_dir = Path(tempfile.gettempdir())
+    for f in tmp_dir.glob("tmp*.pt"):
+        try:
+            age_hours = (time.time() - f.stat().st_mtime) / 3600
+            if age_hours > 1:  # Only clean files older than 1 hour
+                size_mb = f.stat().st_size / (1024 * 1024)
+                f.unlink()
+                print(f"🧹 Cleaned stale temp: {f.name} ({size_mb:.0f} MB, {age_hours:.1f}h old)")
+                cleaned += 1
+        except OSError:
+            pass
+
+    # 2. *.pt.tmp — stale partial downloads next to model cache
+    cwd = Path.cwd()
+    for f in list(cwd.glob("*.pt.tmp")) + list(Path.home().glob(".alice/*.pt.tmp")):
+        try:
+            age_hours = (time.time() - f.stat().st_mtime) / 3600
+            if age_hours > 2:  # Partial downloads older than 2 hours are stale
+                size_mb = f.stat().st_size / (1024 * 1024)
+                f.unlink()
+                print(f"🧹 Cleaned stale partial: {f.name} ({size_mb:.0f} MB, {age_hours:.1f}h old)")
+                cleaned += 1
+        except OSError:
+            pass
+
+    if cleaned:
+        print(f"🧹 Startup cleanup: removed {cleaned} stale file(s)")
+    else:
+        print("✅ Startup cleanup: no stale files found")
+
+
+
+
+def _heartbeat_worker(ps_url: str, auth_token: str, interval: int = 300, stop_event: threading.Event = None):
+    """Background heartbeat to keep miner active on PS during long training."""
+    while not (stop_event and stop_event.is_set()):
+        try:
+            resp = requests.post(
+                f"{ps_url}/heartbeat",
+                headers={"Authorization": f"Bearer {auth_token}"},
+                json={"status": "training"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                pass  # silent success
+            else:
+                print(f"⚠️ Heartbeat returned {resp.status_code}")
+        except Exception:
+            pass  # Do not crash on heartbeat failure
+
+        # Sleep in small chunks so stop_event is responsive
+        for _ in range(interval):
+            if stop_event and stop_event.is_set():
+                break
+            time.sleep(1)
 def main():
     parser = argparse.ArgumentParser(description="Alice Miner V2 - Tiered Training")
     parser.add_argument("--ps-url", required=True, help="Parameter server URL")
     parser.add_argument("--wallet", default=None, help="Wallet address override (debug only)")
-    parser.add_argument("--address", default=None, dest="wallet", help="Alias for --wallet (used by start_mining.sh)")
-    parser.add_argument("--instance-id", default=None, help="Instance identifier (for multi-GPU scripts)")
     parser.add_argument("--wallet-path", type=Path, default=DEFAULT_WALLET_PATH, help="Wallet file path")
     parser.add_argument(
         "--allow-insecure",
@@ -1633,8 +1724,8 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=0,
-        help="Max batch size cap (0 = auto-detect based on GPU memory)",
+        default=2,
+        help="Max batch size cap (default: 2)",
     )
     parser.add_argument(
         "--lr",
@@ -1698,9 +1789,19 @@ def main():
     gradients_rejected = 0
     profile_path = device_profile_path()
 
+    # Startup cleanup: remove stale temp files from previous crashed downloads.
+    _cleanup_stale_temp_files()
+
+    # Heartbeat state (managed across re-registration loops).
+    heartbeat_stop: Optional[threading.Event] = None
+
     # Never exit on transient errors; only Ctrl+C stops the miner.
     while True:
         try:
+            # Stop previous heartbeat if re-registering.
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
+                heartbeat_stop = None
             # Get hardware capabilities (auto-detect unless overridden).
             capabilities = get_hardware_info(args.device)
             profile_key = device_profile_key(wallet_address, capabilities)
@@ -1720,6 +1821,27 @@ def main():
             oom_abort_streak = 0
             upgraded_this_run = False
 
+            # === Aggregator node assignment ===
+            effective_ps_url = args.ps_url
+            try:
+                log.info(f"Requesting node assignment from {args.ps_url}...")
+                assign_resp = requests.get(
+                    f"{args.ps_url}/node/assign",
+                    timeout=10,
+                )
+                if assign_resp.status_code == 200:
+                    assign_data = assign_resp.json()
+                    if assign_data.get("status") == "ok" and assign_data.get("aggregator_url"):
+                        effective_ps_url = assign_data["aggregator_url"]
+                        print(f"📡 Assigned to aggregator: {effective_ps_url}")
+                    else:
+                        print(f"📡 Direct PS mode")
+                else:
+                    print(f"📡 Node assignment unavailable (HTTP {assign_resp.status_code}), using PS directly")
+            except Exception as e:
+                print(f"⚠️ Node assignment failed: {e}, using PS directly")
+            args.ps_url = effective_ps_url
+
             # Registration retry forever.
             register_response = register_miner_with_retry(
                 args.ps_url,
@@ -1733,6 +1855,16 @@ def main():
                 print("❌ Registration succeeded but no auth token returned; retrying in 30s...")
                 time.sleep(30)
                 continue
+
+            # Start heartbeat thread
+            heartbeat_stop = threading.Event()
+            heartbeat_thread = threading.Thread(
+                target=_heartbeat_worker,
+                args=(args.ps_url, auth_token, 300, heartbeat_stop),
+                daemon=True,
+            )
+            heartbeat_thread.start()
+            print("💓 Heartbeat started (every 5min)")
 
             # Use first assigned task to learn layer assignment + model version.
             print("📥 Requesting task to get layer assignment...")
@@ -1767,15 +1899,21 @@ def main():
             print(f"   📋 PS model version: {ps_version}")
 
             # Download partial model (only assigned layers) with version caching
-            # Use --model-path if provided, otherwise default
-            if args.model_path and args.model_path.exists():
+            # Use --model-path location when provided (even if file not yet exists)
+            if args.model_path:
                 model_path = args.model_path
-                print(f"📁 Using pre-downloaded model: {model_path}")
-                need_download = False
+                model_path.parent.mkdir(parents=True, exist_ok=True)
+                if model_path.exists():
+                    print(f"📁 Using pre-downloaded model: {model_path}")
+                    need_download = False
+                else:
+                    print(f"📁 Using custom model cache path: {model_path}")
+                    need_download = True
             else:
                 model_path = Path("./miner_model_partial.pt")
                 need_download = True
-            meta_path = Path("./miner_model_meta.json")
+            # Keep metadata next to model cache to avoid cwd mismatch issues.
+            meta_path = model_path.with_name("miner_model_meta.json")
 
             # Check if cached model is still valid
             if model_path.exists() and meta_path.exists():
@@ -1785,21 +1923,8 @@ def main():
                     local_version = meta.get("version", -1)
                     local_layers = meta.get("layers", [])
                     if local_version == ps_version and local_layers == assigned_layers:
-                        # Verify dim matches (prevents stale 768-dim cache after PS model change)
-                        try:
-                            _probe = torch.load(model_path, map_location="cpu", mmap=True, weights_only=True)
-                            _emb = _probe.get("model.embed_tokens.weight")
-                            _cached_dim = int(_emb.shape[1]) if isinstance(_emb, torch.Tensor) and _emb.ndim == 2 else 0
-                            del _probe
-                            if _cached_dim > 0 and _cached_dim != meta.get("dim", _cached_dim):
-                                print(f"⚠️ Cache dim mismatch: meta={meta.get('dim')} vs file={_cached_dim}, re-downloading")
-                                need_download = True
-                            else:
-                                print(f"✅ Cached model valid (version {local_version}, {len(local_layers)} layers, dim={_cached_dim})")
-                                need_download = False
-                        except Exception:
-                            print("⚠️ Could not verify cached model dimensions, re-downloading")
-                            need_download = True
+                        print(f"✅ Cached model valid (version {local_version}, {len(local_layers)} layers)")
+                        need_download = False
                     elif local_version + 1 == ps_version and local_layers == assigned_layers:
                         # Try delta update
                         print(f"🔄 Attempting delta update (v{local_version} → v{ps_version})...")
@@ -1825,6 +1950,7 @@ def main():
                                 need_download = False
                             else:
                                 print("⚠️ Delta apply failed, falling back to full download")
+                                need_download = True
                         elif delta_resp and delta_resp.get("status") == "no_changes":
                             with open(meta_path, "w") as f:
                                 json.dump({"version": ps_version, "layers": assigned_layers}, f)
@@ -1832,13 +1958,16 @@ def main():
                             need_download = False
                         else:
                             print("⚠️ Delta not available, falling back to full download")
+                            need_download = True
                     else:
                         print(
                             f"⚠️ Cache outdated: local v{local_version} vs PS v{ps_version} "
                             "(gap too large or layers changed)"
                         )
+                        need_download = True
                 except Exception:
                     print("⚠️ Could not read cache metadata, will re-download")
+                    need_download = True
 
             if need_download:
                 ok, total_bytes = download_partial_model_with_retry(
@@ -1901,6 +2030,8 @@ def main():
             alice_config.head_dim = max(1, inferred_dim // max(1, inferred_heads))
             alice_config.num_layers = len(assigned_layers)  # KEY: N layers, not 32
 
+            print(f"DEBUG config.num_layers = {alice_config.num_layers}")
+            print(f"DEBUG config.num_hidden_layers = {getattr(alice_config, 'num_hidden_layers', 'NOT SET')}")
             # Build the partial model normally so all buffers are initialized.
             # The meta->to_empty path can leave non-parameter buffers uninitialized
             # when loading with strict=False, which leads to NaN during forward pass.
@@ -1942,6 +2073,8 @@ def main():
             gc.collect()
 
             print(f"   ✅ Loaded {len(assigned_layers)}-layer partial model")
+            print(f"DEBUG actual layers = {len(model.model.layers)}")
+            print(f"DEBUG params = {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
 
             # Move model to target precision/device.
             n_layers = 32  # Total layers in full model (partial model has fewer)
@@ -2338,6 +2471,10 @@ def main():
 
         except KeyboardInterrupt:
             print("\n🛑 Miner stopped by user")
+            try:
+                heartbeat_stop.set()
+            except Exception:
+                pass
             return
         except Exception as e:
             print(f"❌ Unexpected error: {e}. Restarting in 30s...")
