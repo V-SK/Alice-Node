@@ -297,6 +297,26 @@ Model updates happen automatically — the PS sends a `/reload` request when a n
 
 ---
 
+## Firewall
+
+Your scorer needs port **8090** open for incoming connections from the Parameter Server.
+
+```bash
+# Ubuntu/Debian
+ufw allow 8090/tcp
+ufw reload
+
+# Or if behind NAT, set up port forwarding on your router
+```
+
+The PS will connect to your scorer at the endpoint you registered during staking. Make sure this endpoint is reachable from the internet.
+
+| Port | Direction | Purpose             |
+|------|-----------|---------------------|
+| 8090 | Inbound   | PS sends score tasks |
+
+---
+
 ## Links
 
 - [Alice Protocol](https://aliceprotocol.org)
