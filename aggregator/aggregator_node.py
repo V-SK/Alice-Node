@@ -25,6 +25,7 @@ import threading
 import logging
 import argparse
 import zlib
+import gc
 
 import requests
 import torch
@@ -296,6 +297,11 @@ class AggregatorNode:
     def _epoch_sync_loop(self):
         """Background thread: sync epoch state with PS."""
         while True:
+            # Retry aggregator init if still not initialized
+            if self.streaming_agg is None and self.model_shapes == {}:
+                log.info("[EPOCH SYNC] Aggregator not initialized, retrying from local model...")
+                self._init_aggregator_from_model()
+
             try:
                 resp = requests.get(f"{self.ps_url}/epoch/status", timeout=10)
                 if resp.status_code == 200:
@@ -373,6 +379,11 @@ class AggregatorNode:
 
     def _start_new_epoch(self, epoch_number):
         """Start new epoch."""
+        # Ensure aggregator is initialized before starting epoch
+        if self.streaming_agg is None:
+            log.warning("[EPOCH] Aggregator not initialized, attempting init before epoch %d", epoch_number)
+            self._init_aggregator_from_model()
+
         self.current_epoch = epoch_number
         self.epoch_start_time = time.time()
         self.epoch_contributions = []
@@ -405,6 +416,32 @@ class AggregatorNode:
     # ============================================
     # Initialization
     # ============================================
+
+
+    def _init_aggregator_from_model(self):
+        """Load model shapes from local checkpoint, init StreamingAggregator, release weights."""
+        model_path = os.path.join(self.model_dir, "model_current.pt")
+        if not os.path.exists(model_path):
+            log.warning("[INIT] No model file at %s, aggregator not initialized", model_path)
+            return False
+
+        log.info("[INIT] Loading model shapes from local checkpoint %s ...", model_path)
+        try:
+            state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+            self.model_shapes = {name: tuple(tensor.shape) for name, tensor in state_dict.items()}
+            del state_dict
+            gc.collect()
+        except Exception as e:
+            log.error("[INIT] Failed to load model shapes from checkpoint: %s", e)
+            return False
+
+        self.streaming_agg = StreamingAggregator(
+            model_shapes=self.model_shapes,
+            device="cpu",
+            dtype=torch.float32,
+        )
+        log.info("[INIT] StreamingAggregator initialized from local model: %d params", len(self.model_shapes))
+        return True
 
     def initialize(self):
         """Startup: download model, connect to PS, init aggregator."""
@@ -453,9 +490,11 @@ class AggregatorNode:
                 device="cpu",
                 dtype=torch.float32,
             )
-            log.info(f"[INIT] StreamingAggregator initialized: {len(self.model_shapes)} params")
+            log.info(f"[INIT] StreamingAggregator initialized from PS: {len(self.model_shapes)} params")
         else:
-            log.warning("[INIT] No model shapes, aggregator not initialized (will retry on first epoch sync)")
+            # Fallback: extract shapes from local model checkpoint
+            log.info("[INIT] PS did not provide model shapes, trying local checkpoint...")
+            self._init_aggregator_from_model()
 
         # Start epoch sync loop
         threading.Thread(target=self._epoch_sync_loop, daemon=True, name="epoch_sync").start()
