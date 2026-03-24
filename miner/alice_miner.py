@@ -69,7 +69,7 @@ def auto_detect_device() -> Tuple[str, float, str]:
                 check=False,
             )
             memory_gb = int(result.stdout.strip()) / (1024 ** 3)
-        except Exception:
+        except (OSError, ValueError):
             memory_gb = 16.0
         try:
             chip = subprocess.run(
@@ -78,14 +78,14 @@ def auto_detect_device() -> Tuple[str, float, str]:
                 text=True,
                 check=False,
             ).stdout.strip()
-        except Exception:
+        except (OSError, ValueError):
             chip = "Apple Silicon"
         return "mps", memory_gb, chip or "Apple Silicon"
 
     try:
         import psutil
         memory_gb = psutil.virtual_memory().total / (1024 ** 3)
-    except Exception:
+    except (ImportError, OSError):
         memory_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024 ** 3)
     return "cpu", memory_gb, (platform.processor() or "Unknown CPU")
 
@@ -188,7 +188,7 @@ def get_hardware_info(device_override: Optional[str] = None) -> Dict[str, Any]:
         import psutil
         system_memory_gb = psutil.virtual_memory().total / (1024 ** 3)
         cpu_count = psutil.cpu_count() or 1
-    except Exception:
+    except (ImportError, OSError):
         system_memory_gb = detected_memory_gb if device_type == "cpu" else 16.0
         cpu_count = os.cpu_count() or 1
 
@@ -282,7 +282,7 @@ def load_device_profile(path: Path, key: str) -> Dict[str, Any]:
         profiles = data.get("profiles", {})
         profile = profiles.get(key, {})
         return profile if isinstance(profile, dict) else {}
-    except Exception:
+    except (OSError, json.JSONDecodeError, ValueError):
         return {}
 
 
@@ -294,7 +294,7 @@ def save_device_profile(path: Path, key: str, updates: Dict[str, Any]) -> None:
             existing = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(existing, dict):
                 data.update(existing)
-    except Exception:
+    except (OSError, json.JSONDecodeError, ValueError):
         pass
     profiles = data.get("profiles")
     if not isinstance(profiles, dict):
@@ -1618,7 +1618,7 @@ def submit_gradient(
                 f"{ps_url}/task/complete",
                 json=payload,
                 headers=_auth_headers(auth_token),
-                timeout=900,
+                timeout=120,
             )
 
             if resp.status_code == 200:
@@ -1702,7 +1702,7 @@ def _heartbeat_worker(ps_url: str, auth_token: str, interval: int = 300, stop_ev
                 pass  # silent success
             else:
                 print(f"⚠️ Heartbeat returned {resp.status_code}")
-        except Exception:
+        except (requests.RequestException, ConnectionError, TimeoutError):
             pass  # Do not crash on heartbeat failure
 
         # Sleep in small chunks so stop_event is responsive
@@ -1965,7 +1965,7 @@ def main():
                             "(gap too large or layers changed)"
                         )
                         need_download = True
-                except Exception:
+                except (OSError, json.JSONDecodeError, ValueError):
                     print("⚠️ Could not read cache metadata, will re-download")
                     need_download = True
 
