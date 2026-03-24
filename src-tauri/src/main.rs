@@ -32,9 +32,23 @@ fn main() {
             }
             SystemTrayEvent::MenuItemClick { id, .. } => match id.as_str() {
                 "quit" => {
-                    // Stop mining process if running before exiting
+                    // Stop all child processes before exiting
                     if let Some(mining_state) = app.try_state::<commands::mining::MiningProcessState>() {
                         if let Ok(mut process) = mining_state.lock() {
+                            if let Some(ref mut child) = process.child {
+                                let _ = child.kill();
+                            }
+                        }
+                    }
+                    if let Some(scoring_state) = app.try_state::<commands::scoring::ScoringProcessState>() {
+                        if let Ok(mut process) = scoring_state.lock() {
+                            if let Some(ref mut child) = process.child {
+                                let _ = child.kill();
+                            }
+                        }
+                    }
+                    if let Some(agg_state) = app.try_state::<commands::aggregating::AggregatingProcessState>() {
+                        if let Ok(mut process) = agg_state.lock() {
                             if let Some(ref mut child) = process.child {
                                 let _ = child.kill();
                             }
@@ -73,8 +87,26 @@ fn main() {
             commands::model::check_model_status,
             commands::model::download_model,
             commands::model::get_download_progress,
+            // Role
+            commands::role::save_role,
+            commands::role::get_role,
+            commands::role::clear_role,
+            // Scoring
+            commands::scoring::start_scoring,
+            commands::scoring::stop_scoring,
+            commands::scoring::get_scoring_status,
+            // Aggregating
+            commands::aggregating::start_aggregating,
+            commands::aggregating::stop_aggregating,
+            commands::aggregating::get_aggregating_status,
+            // Staking
+            commands::staking::stake,
+            commands::staking::unstake,
+            commands::staking::get_staking_info,
         ])
         .manage(std::sync::Mutex::new(commands::mining::MiningProcess::default()))
+        .manage(std::sync::Mutex::new(commands::scoring::ScoringProcess::default()))
+        .manage(std::sync::Mutex::new(commands::aggregating::AggregatingProcess::default()))
         .setup(|app| {
             // Initialize services
             let app_handle = app.handle();

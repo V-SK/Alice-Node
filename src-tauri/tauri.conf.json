@@ -6,7 +6,7 @@
     "distDir": "../dist"
   },
   "package": {
-    "productName": "Alice Miner",
+    "productName": "Alice Node",
     "version": "0.1.0"
   },
   "tauri": {
@@ -47,7 +47,7 @@
         "icons/icon.icns",
         "icons/icon.ico"
       ],
-      "identifier": "org.aliceprotocol.miner",
+      "identifier": "org.aliceprotocol.node",
       "longDescription": "Desktop client for Alice Protocol decentralized AI training network",
       "macOS": {
         "entitlements": null,
@@ -83,7 +83,7 @@
     },
     "windows": [
       {
-        "title": "Alice Miner",
+        "title": "Alice Node",
         "width": 1000,
         "height": 700,
         "minWidth": 800,

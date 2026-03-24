@@ -1,5 +1,5 @@
 [package]
-name = "alice-miner"
+name = "alice-node"
 version = "0.1.0"
 description = "Desktop client for Alice Protocol decentralized AI training"
 authors = ["Alice Protocol"]

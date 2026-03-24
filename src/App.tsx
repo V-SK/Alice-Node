@@ -2,39 +2,42 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
 import Sidebar from "./components/Sidebar";
 import Dashboard from "./pages/Dashboard";
+import ScorerDashboard from "./pages/ScorerDashboard";
+import AggregatorDashboard from "./pages/AggregatorDashboard";
 import Wallet from "./pages/Wallet";
 import Hardware from "./pages/Hardware";
+import Staking from "./pages/Staking";
 import Earnings from "./pages/Earnings";
 import Logs from "./pages/Logs";
 import Settings from "./pages/Settings";
 import Setup from "./pages/Setup";
 import { useAppStore } from "./hooks/useAppStore";
 
-type Page = "dashboard" | "wallet" | "hardware" | "earnings" | "logs" | "settings";
+type Page = "dashboard" | "wallet" | "hardware" | "staking" | "earnings" | "logs" | "settings";
 
 function App() {
   const [currentPage, setCurrentPage] = useState<Page>("dashboard");
   const [isSetupComplete, setIsSetupComplete] = useState<boolean | null>(null);
-  const { setWalletAddress, setNetworkStatus, setGpuInfo } = useAppStore();
+  const { setWalletAddress, setNetworkStatus, setGpuInfo, role, setRole } = useAppStore();
 
   useEffect(() => {
-    // Check if setup is complete
     const checkSetup = async () => {
       try {
         const address = await invoke<string | null>("get_wallet_address");
-        if (address) {
+        const savedRole = await invoke<string | null>("get_role");
+        if (address && savedRole) {
           setWalletAddress(address);
+          setRole(savedRole as any);
           setIsSetupComplete(true);
         } else {
           setIsSetupComplete(false);
         }
       } catch (e) {
-        console.error("Failed to check wallet:", e);
+        console.error("Failed to check setup:", e);
         setIsSetupComplete(false);
       }
     };
 
-    // Initial network check
     const checkNetwork = async () => {
       try {
         const status = await invoke<any>("diagnose_network");
@@ -44,7 +47,6 @@ function App() {
       }
     };
 
-    // Initial GPU check
     const checkGpu = async () => {
       try {
         const gpus = await invoke<any[]>("detect_gpu");
@@ -59,12 +61,12 @@ function App() {
     checkGpu();
   }, []);
 
-  const handleSetupComplete = (address: string) => {
+  const handleSetupComplete = (address: string, selectedRole: string) => {
     setWalletAddress(address);
+    setRole(selectedRole as any);
     setIsSetupComplete(true);
   };
 
-  // Loading state
   if (isSetupComplete === null) {
     return (
       <div className="h-screen bg-black flex items-center justify-center">
@@ -76,23 +78,37 @@ function App() {
     );
   }
 
-  // Setup flow
   if (!isSetupComplete) {
     return <Setup onComplete={handleSetupComplete} />;
   }
 
-  // Main app
+  const renderPage = () => {
+    switch (currentPage) {
+      case "dashboard":
+        if (role === "scorer") return <ScorerDashboard />;
+        if (role === "aggregator") return <AggregatorDashboard />;
+        return <Dashboard />;
+      case "wallet":
+        return <Wallet />;
+      case "hardware":
+        return <Hardware />;
+      case "staking":
+        return <Staking />;
+      case "earnings":
+        return <Earnings />;
+      case "logs":
+        return <Logs />;
+      case "settings":
+        return <Settings onSwitchRole={() => setIsSetupComplete(false)} />;
+      default:
+        return <Dashboard />;
+    }
+  };
+
   return (
     <div className="h-screen bg-black flex overflow-hidden">
       <Sidebar currentPage={currentPage} onPageChange={setCurrentPage} />
-      <main className="flex-1 overflow-auto">
-        {currentPage === "dashboard" && <Dashboard />}
-        {currentPage === "wallet" && <Wallet />}
-        {currentPage === "hardware" && <Hardware />}
-        {currentPage === "earnings" && <Earnings />}
-        {currentPage === "logs" && <Logs />}
-        {currentPage === "settings" && <Settings />}
-      </main>
+      <main className="flex-1 overflow-auto">{renderPage()}</main>
     </div>
   );
 }

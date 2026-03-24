@@ -1,6 +1,8 @@
 import { create } from "zustand";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 
+export type Role = "trainer" | "scorer" | "aggregator" | null;
+
 export interface NetworkStatus {
   ps_reachable: boolean;
   ps_latency_ms: number;
@@ -34,6 +36,30 @@ export interface MiningState {
   error_message?: string;
 }
 
+export interface ScoringState {
+  status: "Idle" | "Starting" | "Running" | "Stopping" | "Error";
+  wallet_address?: string;
+  evaluations: number;
+  epoch_evals: number;
+  queue_depth: number;
+  strikes: number;
+  avg_time_secs: number;
+  model_version?: number;
+  error_message?: string;
+}
+
+export interface AggregatingState {
+  status: "Idle" | "Starting" | "Running" | "Stopping" | "Error";
+  wallet_address?: string;
+  connected_miners: number;
+  max_miners: number;
+  gradients_received: number;
+  epoch_gradients: number;
+  bandwidth_mbps: number;
+  model_version?: number;
+  error_message?: string;
+}
+
 export interface ModelStatus {
   int8_available: boolean;
   fp16_available: boolean;
@@ -43,6 +69,10 @@ export interface ModelStatus {
 }
 
 interface AppState {
+  // Role
+  role: Role;
+  setRole: (role: Role) => void;
+
   // Wallet
   walletAddress: string | null;
   setWalletAddress: (address: string | null) => void;
@@ -58,6 +88,14 @@ interface AppState {
   // Mining
   miningState: MiningState;
   setMiningState: (state: MiningState) => void;
+
+  // Scoring
+  scoringState: ScoringState;
+  setScoringState: (state: ScoringState) => void;
+
+  // Aggregating
+  aggregatingState: AggregatingState;
+  setAggregatingState: (state: AggregatingState) => void;
 
   // Model
   modelStatus: ModelStatus | null;
@@ -83,11 +121,17 @@ interface AppState {
   epochEarned: number;
   setEarnings: (total: number, epoch: number) => void;
 
-  // Miner log listener
+  // Log listeners
   startMinerLogListener: () => Promise<UnlistenFn>;
+  startScorerLogListener: () => Promise<UnlistenFn>;
+  startAggregatorLogListener: () => Promise<UnlistenFn>;
 }
 
 export const useAppStore = create<AppState>((set) => ({
+  // Role
+  role: null,
+  setRole: (role) => set({ role }),
+
   // Wallet
   walletAddress: null,
   setWalletAddress: (address) => set({ walletAddress: address }),
@@ -108,6 +152,28 @@ export const useAppStore = create<AppState>((set) => ({
   },
   setMiningState: (state) => set({ miningState: state }),
 
+  // Scoring
+  scoringState: {
+    status: "Idle",
+    evaluations: 0,
+    epoch_evals: 0,
+    queue_depth: 0,
+    strikes: 0,
+    avg_time_secs: 0,
+  },
+  setScoringState: (state) => set({ scoringState: state }),
+
+  // Aggregating
+  aggregatingState: {
+    status: "Idle",
+    connected_miners: 0,
+    max_miners: 200,
+    gradients_received: 0,
+    epoch_gradients: 0,
+    bandwidth_mbps: 0,
+  },
+  setAggregatingState: (state) => set({ aggregatingState: state }),
+
   // Model
   modelStatus: null,
   setModelStatus: (status) => set({ modelStatus: status }),
@@ -121,7 +187,7 @@ export const useAppStore = create<AppState>((set) => ({
   addLog: (msg, type = "info") =>
     set((state) => ({
       logs: [
-        ...state.logs.slice(-99), // Keep last 100 logs
+        ...state.logs.slice(-99),
         {
           time: new Date().toLocaleTimeString("en-US", { hour12: false }),
           msg,
@@ -136,13 +202,30 @@ export const useAppStore = create<AppState>((set) => ({
   epochEarned: 0,
   setEarnings: (total, epoch) => set({ totalEarned: total, epochEarned: epoch }),
 
-  // Miner log listener: listens for "miner-log" events from the Rust backend
+  // Miner log listener
   startMinerLogListener: async () => {
     return listen<{ type: string; message: string }>("miner-log", (event) => {
       const { type, message } = event.payload;
       const logType = type === "stderr" ? "error" : "info";
-      const store = useAppStore.getState();
-      store.addLog(message, logType);
+      useAppStore.getState().addLog(message, logType);
+    });
+  },
+
+  // Scorer log listener
+  startScorerLogListener: async () => {
+    return listen<{ type: string; message: string }>("scorer-log", (event) => {
+      const { type, message } = event.payload;
+      const logType = type === "stderr" ? "error" : "info";
+      useAppStore.getState().addLog(message, logType);
+    });
+  },
+
+  // Aggregator log listener
+  startAggregatorLogListener: async () => {
+    return listen<{ type: string; message: string }>("aggregator-log", (event) => {
+      const { type, message } = event.payload;
+      const logType = type === "stderr" ? "error" : "info";
+      useAppStore.getState().addLog(message, logType);
     });
   },
 }));

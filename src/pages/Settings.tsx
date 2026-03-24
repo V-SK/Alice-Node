@@ -1,7 +1,13 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
+import { useAppStore } from "../hooks/useAppStore";
 
-export default function Settings() {
+interface SettingsProps {
+  onSwitchRole: () => void;
+}
+
+export default function Settings({ onSwitchRole }: SettingsProps) {
+  const { role } = useAppStore();
   const [autoStart, setAutoStart] = useState(false);
   const [notifications, setNotifications] = useState(true);
   const [language, setLanguage] = useState("en");
@@ -24,7 +30,25 @@ export default function Settings() {
       {/* General */}
       <div className="card space-y-4">
         <h3 className="font-semibold text-zinc-300">General</h3>
-        
+
+        <div className="flex items-center justify-between py-2 border-b border-zinc-800/50">
+          <div>
+            <div className="font-medium">Current Role</div>
+            <div className="text-sm text-zinc-500">
+              {role ? role.charAt(0).toUpperCase() + role.slice(1) : "Not set"}
+            </div>
+          </div>
+          <button
+            onClick={async () => {
+              await invoke("clear_role");
+              onSwitchRole();
+            }}
+            className="btn btn-secondary text-sm"
+          >
+            Switch Role
+          </button>
+        </div>
+
         <div className="flex items-center justify-between py-2">
           <div>
             <div className="font-medium">Language</div>
@@ -57,8 +81,8 @@ export default function Settings() {
         </div>
       </div>
 
-      {/* Mining */}
-      <div className="card space-y-4">
+      {/* Mining (trainer only) */}
+      {role === "trainer" && <div className="card space-y-4">
         <h3 className="font-semibold text-zinc-300">Mining</h3>
         
         <div className="flex items-center justify-between py-2">
@@ -73,7 +97,7 @@ export default function Settings() {
             <option>70%</option>
           </select>
         </div>
-      </div>
+      </div>}
 
       {/* Danger Zone */}
       <div className="card border-red-500/30 space-y-4">
@@ -96,7 +120,7 @@ export default function Settings() {
         <div className="space-y-2 text-sm text-zinc-400">
           <div className="flex justify-between">
             <span>Version</span>
-            <span>0.1.0</span>
+            <span>0.2.0</span>
           </div>
           <div className="flex justify-between">
             <span>Website</span>

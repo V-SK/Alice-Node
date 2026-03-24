@@ -1,5 +1,9 @@
+pub mod aggregating;
 pub mod gpu;
 pub mod mining;
 pub mod model;
 pub mod network;
+pub mod role;
+pub mod scoring;
+pub mod staking;
 pub mod wallet;

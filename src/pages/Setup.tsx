@@ -2,16 +2,19 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/tauri";
 
 interface SetupProps {
-  onComplete: (address: string) => void;
+  onComplete: (address: string, role: string) => void;
 }
 
-type Step = "welcome" | "network" | "gpu" | "model" | "wallet" | "ready";
+type Step = "welcome" | "network" | "gpu" | "model" | "wallet" | "role" | "ready";
 
 export default function Setup({ onComplete }: SetupProps) {
   const [step, setStep] = useState<Step>("welcome");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  
+
+  // Role
+  const [selectedRole, setSelectedRole] = useState<string | null>(null);
+
   // Network check
   const [networkOk, setNetworkOk] = useState(false);
   const [networkStatus, setNetworkStatus] = useState<any>(null);
@@ -146,10 +149,9 @@ export default function Setup({ onComplete }: SetupProps) {
 
   const saveAndFinish = async (address: string) => {
     await invoke("save_wallet_address", { address });
-    // Clear sensitive mnemonic from memory
     setMnemonic("");
     setShowMnemonic(false);
-    setStep("ready");
+    setStep("role");
   };
 
   // Render steps
@@ -426,7 +428,109 @@ export default function Setup({ onComplete }: SetupProps) {
           </div>
         );
 
+      case "role":
+        const roles = [
+          {
+            id: "trainer",
+            label: "Trainer",
+            desc: "Train the model by computing gradients",
+            req: "GPU with 24GB+ VRAM",
+            reward: "94%",
+            stake: "No stake required",
+          },
+          {
+            id: "scorer",
+            label: "Scorer",
+            desc: "Validate gradient quality and earn rewards",
+            req: "CPU with 24GB+ RAM",
+            reward: "5%",
+            stake: "5,000 ALICE stake",
+          },
+          {
+            id: "aggregator",
+            label: "Aggregator",
+            desc: "Aggregate gradients from miners",
+            req: "CPU with 64GB+ RAM, 1TB SSD",
+            reward: "1%",
+            stake: "20,000 ALICE stake",
+          },
+        ];
+        return (
+          <div>
+            <h2 className="text-2xl font-bold mb-2 text-center">Select Your Role</h2>
+            <p className="text-zinc-500 text-sm text-center mb-6">
+              Choose how you want to contribute to the network
+            </p>
+            <div className="space-y-3 max-w-md mx-auto">
+              {roles.map((r) => (
+                <div
+                  key={r.id}
+                  onClick={() => setSelectedRole(r.id)}
+                  className={`card cursor-pointer transition-colors ${
+                    selectedRole === r.id ? "border-alice-500" : "hover:border-zinc-600"
+                  }`}
+                >
+                  <div className="flex items-start gap-3">
+                    <div className="flex-1">
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="font-semibold">{r.label}</span>
+                        <span className="text-xs text-alice-500 bg-alice-500/10 px-2 py-0.5 rounded">
+                          {r.reward} rewards
+                        </span>
+                        <span className="text-xs text-zinc-500 bg-zinc-800 px-2 py-0.5 rounded">
+                          {r.stake}
+                        </span>
+                      </div>
+                      <div className="text-sm text-zinc-400 mb-1">{r.desc}</div>
+                      <div className="text-xs text-zinc-600">Requires: {r.req}</div>
+                    </div>
+                    <div
+                      className={`w-5 h-5 rounded-full border-2 flex items-center justify-center flex-shrink-0 mt-0.5 ${
+                        selectedRole === r.id ? "border-alice-500" : "border-zinc-700"
+                      }`}
+                    >
+                      {selectedRole === r.id && (
+                        <div className="w-2.5 h-2.5 rounded-full bg-alice-500" />
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+            {error && <div className="text-red-500 text-sm text-center mt-4">{error}</div>}
+            <div className="text-center mt-6">
+              <button
+                onClick={async () => {
+                  if (!selectedRole) {
+                    setError("Please select a role");
+                    return;
+                  }
+                  setLoading(true);
+                  try {
+                    await invoke("save_role", { role: selectedRole });
+                    setStep("ready");
+                  } catch (e: any) {
+                    setError(e.toString());
+                  } finally {
+                    setLoading(false);
+                  }
+                }}
+                disabled={!selectedRole || loading}
+                className="btn btn-primary px-8 py-3 disabled:opacity-50"
+              >
+                {loading ? "Saving..." : "Continue"}
+              </button>
+            </div>
+          </div>
+        );
+
       case "ready":
+        const actionLabel =
+          selectedRole === "scorer"
+            ? "Start Scoring"
+            : selectedRole === "aggregator"
+            ? "Start Aggregating"
+            : "Start Mining";
         return (
           <div className="text-center">
             <div className="w-20 h-20 mx-auto mb-6 rounded-full bg-green-500/20 flex items-center justify-center">
@@ -436,13 +540,13 @@ export default function Setup({ onComplete }: SetupProps) {
             </div>
             <h2 className="text-2xl font-bold mb-3">You're all set!</h2>
             <p className="text-zinc-400 mb-8">
-              Your miner is ready to start training. Click below to begin earning ALICE.
+              Your node is ready. Click below to begin earning ALICE.
             </p>
             <button
-              onClick={() => onComplete(walletAddress)}
+              onClick={() => onComplete(walletAddress, selectedRole || "trainer")}
               className="btn btn-primary text-lg px-8 py-3"
             >
-              Start Mining
+              {actionLabel}
             </button>
           </div>
         );
