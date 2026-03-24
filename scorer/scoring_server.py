@@ -516,6 +516,37 @@ class ScoringServer:
             "validation_shards": len(self.validation_shards),
         })
 
+    async def _download_model(self, url: str, dest: str) -> str:
+        """Download model from URL with streaming + progress logging."""
+        log.info(f"[RELOAD] Downloading model from {url}")
+        dest_path = Path(dest)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = str(dest_path) + ".downloading"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=3600)) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"Download failed: HTTP {resp.status}")
+                total = resp.content_length or 0
+                downloaded = 0
+                last_log = 0
+                with open(tmp_path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(1024 * 1024):  # 1MB chunks
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        # Log progress every 50MB
+                        if downloaded - last_log >= 50 * 1024 * 1024:
+                            if total:
+                                pct = downloaded * 100 / total
+                                log.info(f"[RELOAD] Download progress: {downloaded / 1e6:.0f}MB / {total / 1e6:.0f}MB ({pct:.1f}%)")
+                            else:
+                                log.info(f"[RELOAD] Download progress: {downloaded / 1e6:.0f}MB")
+                            last_log = downloaded
+
+        os.rename(tmp_path, dest)
+        log.info(f"[RELOAD] Download complete: {downloaded / 1e6:.1f}MB → {dest}")
+        return dest
+
     async def handle_reload_model(self, request: web.Request) -> web.Response:
         """
         POST /reload
@@ -523,9 +554,12 @@ class ScoringServer:
         Request body (JSON):
         {
             "model_path": "/path/to/new/checkpoint.pt",
-            "model_version": 43
+            "model_version": 43,
+            "download_url": "https://dl.aliceprotocol.org/v43_full.pt"  (optional)
         }
         
+        If download_url is provided, downloads the model first then loads it.
+        If only model_path is provided, loads directly from local path.
         Triggers model reload without restarting the Worker.
         Called by PS after aggregation bumps model_version.
         """
@@ -535,12 +569,25 @@ class ScoringServer:
         try:
             body = await request.json()
             model_path = body.get("model_path")
+            download_url = body.get("download_url")
             new_version = body.get("model_version", self.model_version + 1)
 
-            if not model_path:
-                return web.json_response({"error": "model_path required"}, status=400)
+            if not model_path and not download_url:
+                return web.json_response(
+                    {"error": "model_path or download_url required"}, status=400
+                )
 
             self.busy = True
+
+            # If download_url provided, download first
+            if download_url:
+                if not model_path:
+                    # Default download destination
+                    model_dir = Path(os.environ.get("MODEL_DIR", "/tmp/alice-models"))
+                    model_path = str(model_dir / f"model_v{new_version}.pt")
+                log.info(f"[RELOAD] Will download v{new_version} from URL → {model_path}")
+                await self._download_model(download_url, model_path)
+
             log.info(f"[RELOAD] Loading model v{new_version} from {model_path}")
 
             # Reload model
@@ -552,6 +599,8 @@ class ScoringServer:
             return web.json_response({
                 "status": "reloaded",
                 "model_version": self.model_version,
+                "model_path": model_path,
+                "downloaded": bool(download_url),
             })
         except Exception as e:
             log.error(f"[RELOAD] Failed: {e}", exc_info=True)
