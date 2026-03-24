@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Alice Protocol Miner - One-Click Installer
-# Usage: ./install.sh
-# Skip venv: ALICE_NO_VENV=1 ./install.sh
+# Alice Node — Universal Installer
+# Installs dependencies for mining, scoring, or aggregation.
+#
+# Usage:
+#   ./install.sh              Install all dependencies
+#   ./install.sh --role mine  Install miner dependencies only
+#   ALICE_NO_VENV=1 ./install.sh  Skip venv creation
 
 VENV_DIR=".venv"
 MIN_PYTHON="3.10"
+ROLE="${1:-all}"
+shift 2>/dev/null || true
 
-echo "╔═══════════════════════════════════════╗"
-echo "║   Alice Protocol Miner - Installer    ║"
-echo "╚═══════════════════════════════════════╝"
+echo "╔═══════════════════════════════════════════╗"
+echo "║     Alice Node — Universal Installer      ║"
+echo "║   Mine · Validate · Aggregate             ║"
+echo "╚═══════════════════════════════════════════╝"
 echo ""
 
 # ── Step 1: Find Python 3.10+ ──────────────────────────────────
@@ -35,7 +42,7 @@ find_python() {
 }
 
 PYTHON_BIN=$(find_python) || {
-  echo "Python 3.10+ not found."
+  echo "❌ Python 3.10+ not found."
   echo ""
   echo "Install it:"
   echo "  Ubuntu/Debian:  sudo apt install python3 python3-venv python3-pip"
@@ -46,22 +53,21 @@ PYTHON_BIN=$(find_python) || {
 }
 
 PYTHON_VER="$("$PYTHON_BIN" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')")"
-echo "[1/4] Python: $PYTHON_BIN ($PYTHON_VER)"
+echo "[1/5] Python: $PYTHON_BIN ($PYTHON_VER)"
 
 # ── Step 2: Create venv ─────────────────────────────────────────
 
 if [[ "${ALICE_NO_VENV:-0}" == "1" ]]; then
-  echo "[2/4] Skipping venv (ALICE_NO_VENV=1)"
+  echo "[2/5] Skipping venv (ALICE_NO_VENV=1)"
   PIP="$PYTHON_BIN -m pip"
 else
   if [[ ! -d "$VENV_DIR" ]]; then
-    echo "[2/4] Creating virtual environment..."
+    echo "[2/5] Creating virtual environment..."
     "$PYTHON_BIN" -m venv "$VENV_DIR"
   else
-    echo "[2/4] Virtual environment exists"
+    echo "[2/5] Virtual environment exists"
   fi
 
-  # Activate
   if [[ -f "$VENV_DIR/bin/activate" ]]; then
     source "$VENV_DIR/bin/activate"
   elif [[ -f "$VENV_DIR/Scripts/activate" ]]; then
@@ -73,7 +79,6 @@ fi
 # ── Step 3: Detect GPU & install PyTorch ────────────────────────
 
 detect_gpu() {
-  # NVIDIA CUDA
   if command -v nvidia-smi >/dev/null 2>&1; then
     local cuda_ver
     cuda_ver="$(nvidia-smi 2>/dev/null | grep -o 'CUDA Version: [0-9]*\.[0-9]*' | head -1 | sed 's/CUDA Version: //' || true)"
@@ -83,7 +88,6 @@ detect_gpu() {
     fi
   fi
 
-  # macOS MPS
   if [[ "$(uname -s)" == "Darwin" ]]; then
     local chip
     chip="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)"
@@ -99,7 +103,7 @@ detect_gpu() {
 GPU_INFO="$(detect_gpu)"
 GPU_TYPE="${GPU_INFO%%:*}"
 
-echo "[3/4] Installing PyTorch ($GPU_TYPE)..."
+echo "[3/5] Installing PyTorch ($GPU_TYPE)..."
 
 case "$GPU_TYPE" in
   cuda)
@@ -115,7 +119,6 @@ case "$GPU_TYPE" in
     fi
     ;;
   mps)
-    # macOS: default pip torch includes MPS support
     $PIP install --upgrade torch -q
     ;;
   cpu)
@@ -123,15 +126,37 @@ case "$GPU_TYPE" in
     ;;
 esac
 
-# Install other dependencies
+# ── Step 4: Install Python dependencies ─────────────────────────
+
+echo "[4/5] Installing dependencies..."
+
 if [[ -f "requirements.txt" ]]; then
   $PIP install -r requirements.txt -q
 fi
 
-# ── Step 4: Verify ──────────────────────────────────────────────
+# Role-specific extras
+case "$ROLE" in
+  score|scorer)
+    $PIP install -q aiohttp
+    echo "  + aiohttp (scorer HTTP server)"
+    ;;
+  aggregate|aggregator)
+    $PIP install -q flask
+    echo "  + flask (aggregator HTTP server)"
+    ;;
+  all)
+    $PIP install -q aiohttp flask
+    echo "  + aiohttp + flask (all roles)"
+    ;;
+esac
 
-echo "[4/4] Verifying installation..."
+# ── Step 5: Setup & verify ──────────────────────────────────────
+
+echo "[5/5] Verifying installation..."
 echo ""
+
+# Create ~/.alice/ directory
+mkdir -p "$HOME/.alice"
 
 "$PYTHON_BIN" -c "
 import torch
@@ -156,8 +181,16 @@ print(f'  Python:   {sys.version.split()[0]}')
 print()
 "
 
-echo "Installation complete!"
+echo "✅ Installation complete!"
 echo ""
-echo "To start mining:"
-echo "  ./start_mining.sh"
+echo "┌─────────────────────────────────────────────────┐"
+echo "│  Quick Start                                    │"
+echo "├─────────────────────────────────────────────────┤"
+echo "│  Mine:       python alice_node.py mine          │"
+echo "│  Score:      python alice_node.py score         │"
+echo "│  Aggregate:  python alice_node.py aggregate     │"
+echo "│  Wallet:     python alice_node.py wallet create │"
+echo "│  Status:     python alice_node.py status        │"
+echo "│  Help:       python alice_node.py --help        │"
+echo "└─────────────────────────────────────────────────┘"
 echo ""

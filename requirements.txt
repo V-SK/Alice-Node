@@ -1,8 +1,16 @@
-# PyTorch is installed by install.sh with correct GPU support
-# Do NOT add torch here — it would override the GPU-specific version
+# Alice Node — Python Dependencies
+# PyTorch is installed by install.sh with correct GPU support.
+# Do NOT add torch here — it would override the GPU-specific version.
+
 substrate-interface>=1.7.0
 cryptography
 requests
 psutil
 mnemonic
 numpy
+
+# Scorer (optional — only if running scorer)
+# aiohttp
+
+# Aggregator (optional — only if running aggregator)
+# flask

@@ -6,9 +6,13 @@ __pycache__/
 *.bin
 logs/
 models/
+data/
 .alice/
 wallet.json
 *.bak
 *.bak.*
 venv/
 .venv/
+dist/
+build/
+*.egg-info/
