@@ -832,10 +832,8 @@ def detect_device() -> str:
     env_device = os.environ.get("DEVICE", "auto")
     if env_device != "auto":
         return env_device
-    if torch.cuda.is_available():
-        return "cuda"
-    # MPS is slower than CPU for validation workloads on Apple Silicon;
-    # skip auto-detection of MPS, users can still force with --device mps
+    # CPU is generally optimal for scorer validation workloads;
+    # users can force cuda/mps with --device or DEVICE env var
     return "cpu"
 
 
