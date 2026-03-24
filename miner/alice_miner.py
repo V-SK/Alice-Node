@@ -7,11 +7,10 @@ Requests tasks from PS, downloads shards on-demand, trains assigned layers, and 
 import argparse
 import base64
 import contextlib
-import sys
 try:
-    import fcntl
+    import fcntl  # POSIX
 except ImportError:
-    fcntl = None  # Windows
+    fcntl = None
 import hashlib
 import json
 import logging
@@ -20,7 +19,6 @@ import os
 import platform
 import subprocess
 import tempfile
-import threading
 import time
 import zlib
 from pathlib import Path
@@ -38,20 +36,23 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from core.model import LlamaNanoModel, LlamaNanoConfig
 from core.compression import TopKCompressor
-from core.secure_wallet import DEFAULT_WALLET_PATH, get_or_create_wallet_for_miner
 try:
     from src.model import AliceConfig, AliceForCausalLM
     ALICE_MODEL_AVAILABLE = True
-except ImportError:
+    ALICE_MODEL_IMPORT_ERROR = None
+except ImportError as exc:
     ALICE_MODEL_AVAILABLE = False
+    ALICE_MODEL_IMPORT_ERROR = str(exc)
 
 PROTOCOL_VERSION = "1.0"
 DATA_FORMAT = "tensor"
-USE_ERROR_FEEDBACK = os.getenv("USE_ERROR_FEEDBACK", "0") == "1"
-EF_DTYPE = torch.float16
 DEVICE_PROFILE_PATH = Path.home() / ".alice" / "device_profile.json"
 DEVICE_PROFILE_VERSION = 1
 PIDFILE_PATH = Path.home() / ".alice" / "miner.pid"
+
+MAX_DELTA_HOPS = 10
+KEEP_VERSIONS = 2
+DEFAULT_MODEL_DIR = Path.home() / ".alice" / "models"
 
 def auto_detect_device() -> Tuple[str, float, str]:
     """Auto-detect best available device and memory."""
@@ -69,7 +70,7 @@ def auto_detect_device() -> Tuple[str, float, str]:
                 check=False,
             )
             memory_gb = int(result.stdout.strip()) / (1024 ** 3)
-        except (OSError, ValueError):
+        except Exception:
             memory_gb = 16.0
         try:
             chip = subprocess.run(
@@ -78,15 +79,38 @@ def auto_detect_device() -> Tuple[str, float, str]:
                 text=True,
                 check=False,
             ).stdout.strip()
-        except (OSError, ValueError):
+        except Exception:
             chip = "Apple Silicon"
         return "mps", memory_gb, chip or "Apple Silicon"
 
     try:
         import psutil
         memory_gb = psutil.virtual_memory().total / (1024 ** 3)
-    except (ImportError, OSError):
-        memory_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024 ** 3)
+    except Exception:
+        # Windows has no os.sysconf; fall back to ctypes GlobalMemoryStatusEx.
+        try:
+            if os.name == "nt":
+                import ctypes
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+                stat = MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+                memory_gb = stat.ullTotalPhys / (1024 ** 3)
+            else:
+                memory_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024 ** 3)
+        except Exception:
+            memory_gb = 16.0
     return "cpu", memory_gb, (platform.processor() or "Unknown CPU")
 
 
@@ -188,7 +212,7 @@ def get_hardware_info(device_override: Optional[str] = None) -> Dict[str, Any]:
         import psutil
         system_memory_gb = psutil.virtual_memory().total / (1024 ** 3)
         cpu_count = psutil.cpu_count() or 1
-    except (ImportError, OSError):
+    except Exception:
         system_memory_gb = detected_memory_gb if device_type == "cpu" else 16.0
         cpu_count = os.cpu_count() or 1
 
@@ -282,7 +306,7 @@ def load_device_profile(path: Path, key: str) -> Dict[str, Any]:
         profiles = data.get("profiles", {})
         profile = profiles.get(key, {})
         return profile if isinstance(profile, dict) else {}
-    except (OSError, json.JSONDecodeError, ValueError):
+    except Exception:
         return {}
 
 
@@ -294,7 +318,7 @@ def save_device_profile(path: Path, key: str, updates: Dict[str, Any]) -> None:
             existing = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(existing, dict):
                 data.update(existing)
-    except (OSError, json.JSONDecodeError, ValueError):
+    except Exception:
         pass
     profiles = data.get("profiles")
     if not isinstance(profiles, dict):
@@ -323,15 +347,23 @@ def acquire_single_instance_lock() -> Any:
     """Ensure only one miner instance runs per host user."""
     PIDFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
     lock_fp = PIDFILE_PATH.open("w", encoding="utf-8")
-    try:
-        if fcntl:
+
+    # POSIX path
+    if fcntl is not None:
+        try:
             fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        else:
-            import msvcrt
+        except OSError:
+            print("❌ Another miner instance is already running. Exiting.")
+            sys.exit(1)
+    else:
+        # Windows path
+        try:
+            import msvcrt  # type: ignore
             msvcrt.locking(lock_fp.fileno(), msvcrt.LK_NBLCK, 1)
-    except OSError:
-        print("❌ Another miner instance is already running. Exiting.")
-        sys.exit(1)
+        except Exception:
+            print("❌ Another miner instance is already running. Exiting.")
+            sys.exit(1)
+
     lock_fp.write(str(os.getpid()))
     lock_fp.flush()
     os.fsync(lock_fp.fileno())
@@ -347,86 +379,47 @@ def _auth_headers(auth_token: Optional[str]) -> Dict[str, str]:
 def register_miner(
     ps_url: str,
     wallet_address: str,
-    wallet_keypair: Optional[Any],
+    instance_id: Optional[str],
     capabilities: Dict[str, Any],
 ) -> Optional[Dict]:
-    """
-    Register with PS and report hardware capabilities.
-    
-    Returns:
-        Registration response dict or None if failed
-    """
+    """Single-step registration (no challenge/signature)."""
     try:
-        resp = requests.post(
-            f"{ps_url}/register",
-            json={
-                "wallet": wallet_address,  # backward-compatible key
-                "miner_id": wallet_address,
-                "wallet_address": wallet_address,
-                "protocol_version": PROTOCOL_VERSION,
-                "data_format": DATA_FORMAT,
-                "capabilities": {
-                    "memory_gb": float(capabilities.get("memory_gb", 0.0)),
-                    "device_type": capabilities.get("device_type", "cpu"),
-                    "device_name": capabilities.get("device_name", "unknown"),
-                    "system_memory_gb": float(capabilities.get("system_memory_gb", 0.0)),
-                },
+        payload = {
+            "address": wallet_address,
+            "wallet": wallet_address,
+            "wallet_address": wallet_address,
+            "protocol_version": PROTOCOL_VERSION,
+            "data_format": DATA_FORMAT,
+            "capabilities": {
+                "memory_gb": float(capabilities.get("memory_gb", 0.0)),
+                "device_type": capabilities.get("device_type", "cpu"),
+                "device_name": capabilities.get("device_name", "unknown"),
+                "system_memory_gb": float(capabilities.get("system_memory_gb", 0.0)),
             },
-            timeout=10
-        )
+            "reward_address": capabilities.get("reward_address"),
+        }
+        if instance_id:
+            payload["instance_id"] = str(instance_id)
+
+        resp = requests.post(f"{ps_url}/register", json=payload, timeout=10)
         if resp.status_code != 200:
             print(f"❌ Registration failed: {resp.status_code} {resp.text}")
             return None
 
         data = resp.json()
-        # Backward compatibility: older PS may still return token directly.
-        if data.get("token"):
-            print(f"✅ Registered with PS: {wallet_address}")
-            print(
-                f"   Hardware: {capabilities['device_type']}, "
-                f"{capabilities['memory_gb']:.1f}GB device, "
-                f"{capabilities['system_memory_gb']:.1f}GB system"
-            )
-            return data
-
-        challenge = str(data.get("challenge", "")).strip()
-        status = str(data.get("status", "")).strip()
-        if status != "challenge_required" or not challenge:
-            print(f"❌ Registration failed: unexpected response {data}")
+        token = str(data.get("token", "")).strip()
+        if not token:
+            print(f"❌ Registration failed: token missing in response {data}")
             return None
 
-        if wallet_keypair is None:
-            print(
-                "❌ PS requires signed challenge-response registration. "
-                "Raw --wallet bypass cannot sign; use encrypted wallet."
-            )
-            sys.exit(1)
-
-        sig = wallet_keypair.sign(challenge.encode("utf-8"))
-        if isinstance(sig, str):
-            sig_hex = sig[2:] if sig.startswith("0x") else sig
-        else:
-            sig_hex = bytes(sig).hex()
-        verify_resp = requests.post(
-            f"{ps_url}/register/verify",
-            json={
-                "miner_id": wallet_address,
-                "challenge": challenge,
-                "signature": sig_hex,
-            },
-            timeout=10,
+        reg_instance_id = str(data.get("instance_id") or data.get("miner_id") or instance_id or wallet_address)
+        print(f"✅ Registered with PS: address={wallet_address[:12]}... instance_id={reg_instance_id}")
+        print(
+            f"   Hardware: {capabilities['device_type']}, "
+            f"{capabilities['memory_gb']:.1f}GB device, "
+            f"{capabilities['system_memory_gb']:.1f}GB system"
         )
-        if verify_resp.status_code == 200:
-            verify_data = verify_resp.json()
-            print(f"✅ Registered with PS: {wallet_address}")
-            print(
-                f"   Hardware: {capabilities['device_type']}, "
-                f"{capabilities['memory_gb']:.1f}GB device, "
-                f"{capabilities['system_memory_gb']:.1f}GB system"
-            )
-            return verify_data
-        print(f"❌ Registration verify failed: {verify_resp.status_code} {verify_resp.text}")
-        return None
+        return data
     except Exception as e:
         print(f"❌ Registration error: {e}")
         return None
@@ -535,8 +528,6 @@ def register_compression_hooks(
     scaler: Optional[torch.cuda.amp.GradScaler] = None,
     grad_scale: float = 1.0,
     small_tensor_threshold: int = 10000,
-    use_error_feedback: bool = False,
-    residuals: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Tuple[List[Any], Dict[str, Dict[str, Any]]]:
     """
     Register post-accumulate grad hooks that compress and release gradients per-parameter.
@@ -571,6 +562,8 @@ def register_compression_hooks(
                 if meta["bad_param"] is None:
                     meta["bad_param"] = _name
                 _param.grad = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 return
 
             work_grad = grad.detach()
@@ -581,29 +574,12 @@ def register_compression_hooks(
             if grad_scale != 1.0:
                 work_grad = work_grad * float(grad_scale)
 
-            cpu_grad = work_grad.detach().to(device="cpu", dtype=torch.float32)
-            if use_error_feedback and residuals is not None:
-                residual = residuals.get(_name)
-                if residual is not None:
-                    cpu_grad = cpu_grad + residual.to(device="cpu", dtype=torch.float32)
-
+            cpu_grad = work_grad.to(dtype=torch.float32)  # GPU topk fix
             indices_np, values_np = topk_compress(
                 cpu_grad,
                 ratio=ratio,
                 small_tensor_threshold=small_tensor_threshold,
             )
-
-            if use_error_feedback and residuals is not None:
-                sent_dense = torch.zeros(cpu_grad.numel(), dtype=torch.float32, device="cpu")
-                if indices_np.size > 0:
-                    idx_t = torch.from_numpy(indices_np).to(dtype=torch.long)
-                    val_t = torch.from_numpy(values_np).to(dtype=torch.float32)
-                    sent_dense[idx_t] = val_t
-                new_residual = (cpu_grad.flatten() - sent_dense).view_as(cpu_grad).to(dtype=EF_DTYPE, device="cpu")
-                residuals[_name] = new_residual
-
-            layer_name = _name.split(".")[2] if _name.startswith("model.layers.") and len(_name.split(".")) > 2 else (_name.split(".")[1] if _name.startswith("layers.") and len(_name.split(".")) > 1 else _name)
-            print(f"[EF_SEND] enabled={int(use_error_feedback)} layer={layer_name} sent_nnz={int(indices_np.size)}")
 
             bucket = compressed_grads.get(_name)
             if bucket is None:
@@ -618,6 +594,8 @@ def register_compression_hooks(
             bucket["values"].append(values_np)
 
             _param.grad = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         hooks.append(param.register_post_accumulate_grad_hook(_hook))
 
@@ -835,48 +813,46 @@ def _validate_delta_tensors(
 
 
 
-def apply_delta_update(model_path: Path, delta_data: Dict, from_version: int, to_version: int) -> bool:
+def apply_delta_update(base_model_path: Path, output_model_path: Path, delta_data: Dict, from_version: int, to_version: int) -> bool:
     """
-    Apply delta update to cached model.
-    
+    Apply delta update to cached model file.
+
     Args:
-        model_path: Path to cached model file
-        delta_data: Compressed delta from PS
+        base_model_path: Existing local model path (from_version)
+        output_model_path: New model path to write (to_version)
+        delta_data: Compressed delta payload from PS
         from_version: Version we're updating from
         to_version: Version we're updating to
-    
+
     Returns:
         True if successful
     """
     from src.compression import decompress_gradients
-    
+
     print(f"🔄 Applying delta update (v{from_version} → v{to_version})...")
-    
+
     try:
-        # Load current model
-        state_dict = torch.load(model_path, map_location='cpu', weights_only=True)
-        
-        # Decompress delta (binary_v2 compatible)
+        state_dict = torch.load(base_model_path, map_location='cpu', weights_only=True)
         delta = decompress_gradients(delta_data, device=torch.device("cpu"))
 
         ok, reason = _validate_delta_tensors(state_dict, delta)
         if not ok:
             print(f"   ❌ Delta validation failed: {reason}")
             return False
-        
-        # Apply delta: new = old + delta
+
         updated_count = 0
         for name, diff in delta.items():
             if name in state_dict:
                 state_dict[name] = state_dict[name] + diff
                 updated_count += 1
-        
-        # Save updated model
-        torch.save(state_dict, model_path)
-        
+
+        tmp_out = output_model_path.with_suffix(output_model_path.suffix + '.tmp')
+        torch.save(state_dict, tmp_out)
+        os.replace(tmp_out, output_model_path)
+
         print(f"   ✅ Applied delta to {updated_count} parameters")
         return True
-        
+
     except Exception as e:
         print(f"   ❌ Delta apply failed: {e}")
         return False
@@ -914,17 +890,176 @@ def request_delta_update(ps_url: str, from_version: int, auth_token: Optional[st
         return None
 
 
+def _model_version_file(model_dir: Path) -> Path:
+    return model_dir / "current_version"
+
+
+def _model_file_path(model_dir: Path, version: int) -> Path:
+    return model_dir / f"alice-7b-v{int(version)}.pt"
+
+
+def read_local_version(model_dir: Path) -> Optional[int]:
+    vf = _model_version_file(model_dir)
+    if not vf.exists():
+        return None
+    try:
+        value = vf.read_text().strip()
+        return int(value) if value else None
+    except Exception:
+        return None
+
+
+def write_local_version(model_dir: Path, version: int) -> None:
+    model_dir.mkdir(parents=True, exist_ok=True)
+    _model_version_file(model_dir).write_text(str(int(version)))
+
+
+def compute_hash(filepath: Path) -> str:
+    sha256 = hashlib.sha256()
+    with filepath.open('rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            if chunk:
+                sha256.update(chunk)
+    return sha256.hexdigest()
+
+
+def save_hash(filepath: Path) -> None:
+    hv = compute_hash(filepath)
+    Path(str(filepath) + '.sha256').write_text(hv)
+
+
+def verify_hash(filepath: Path) -> bool:
+    hp = Path(str(filepath) + '.sha256')
+    if not filepath.exists() or not hp.exists():
+        return False
+    try:
+        expected = hp.read_text().strip()
+        actual = compute_hash(filepath)
+        return bool(expected) and expected == actual
+    except Exception:
+        return False
+
+
+def cleanup_old_versions(model_dir: Path, keep: int = KEEP_VERSIONS) -> None:
+    keep = max(1, int(keep))
+    files = sorted(
+        model_dir.glob('alice-7b-v*.pt'),
+        key=lambda p: int(p.stem.split('-v')[-1]) if '-v' in p.stem else -1,
+        reverse=True,
+    )
+    for old_file in files[keep:]:
+        with contextlib.suppress(Exception):
+            old_file.unlink()
+        with contextlib.suppress(Exception):
+            Path(str(old_file) + '.sha256').unlink()
+        print(f"[Model] 清理旧版本: {old_file.name}")
+
+
+@contextlib.contextmanager
+def model_download_lock(model_dir: Path):
+    model_dir.mkdir(parents=True, exist_ok=True)
+    lock_file = model_dir / '.download.lock'
+    lock_fp = lock_file.open('w')
+    try:
+        if fcntl is not None:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(Exception):
+            if fcntl is not None:
+                fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+        with contextlib.suppress(Exception):
+            lock_fp.close()
+
+
+def ensure_cached_model(
+    ps_url: str,
+    ps_version: int,
+    assigned_layers: List[int],
+    model_dir: Path,
+    auth_token: Optional[str] = None,
+) -> Tuple[Path, bool]:
+    """
+    Ensure local cached model for ps_version exists and is valid.
+
+    Returns:
+        (model_path, changed)
+    """
+    model_dir = model_dir.expanduser()
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    with model_download_lock(model_dir):
+        local_version = read_local_version(model_dir)
+        local_path: Optional[Path] = None
+        if local_version is not None:
+            local_path = _model_file_path(model_dir, local_version)
+            if not verify_hash(local_path):
+                print(f"[Model] 本地模型 hash 校验失败: {local_path.name}，将重新下载")
+                with contextlib.suppress(Exception):
+                    local_path.unlink()
+                with contextlib.suppress(Exception):
+                    Path(str(local_path) + '.sha256').unlink()
+                local_version = None
+                local_path = None
+
+        # cache hit
+        if local_version is not None and local_version == ps_version and local_path is not None:
+            print(f"[Model] 本地模型 v{local_version} 已存在且校验通过，跳过下载")
+            return local_path, False
+
+        # delta path (best-effort)
+        if local_version is not None and local_path is not None and ps_version > local_version:
+            gap = ps_version - local_version
+            if gap <= MAX_DELTA_HOPS:
+                print(f"[Model] 本地版本: v{local_version}, PS 版本: v{ps_version}，尝试 delta 更新")
+                delta_resp = request_delta_update(ps_url, local_version, auth_token=auth_token)
+                if delta_resp and delta_resp.get('status') == 'ok':
+                    delta_data = delta_resp.get('delta')
+                    to_version = int(delta_resp.get('to_version', ps_version) or ps_version)
+                    if to_version == ps_version and isinstance(delta_data, dict):
+                        new_path = _model_file_path(model_dir, ps_version)
+                        if apply_delta_update(local_path, new_path, delta_data, local_version, ps_version):
+                            save_hash(new_path)
+                            write_local_version(model_dir, ps_version)
+                            cleanup_old_versions(model_dir, keep=KEEP_VERSIONS)
+                            return new_path, True
+                elif delta_resp and delta_resp.get('status') == 'no_changes':
+                    write_local_version(model_dir, ps_version)
+                    if local_path and local_path.exists():
+                        return local_path, False
+                print("[Model] delta 不可用或失败，回退完整下载")
+            else:
+                print(f"[Model] 版本差距 {gap} > {MAX_DELTA_HOPS}，直接完整下载")
+
+        # full download
+        target = _model_file_path(model_dir, ps_version)
+        ok, total_bytes = download_partial_model_with_retry(
+            ps_url,
+            assigned_layers=assigned_layers,
+            model_path=target,
+            auth_token=auth_token,
+            max_attempts=3,
+            retry_delay=10,
+        )
+        if not ok:
+            raise RuntimeError('model download failed after retries')
+        save_hash(target)
+        write_local_version(model_dir, ps_version)
+        cleanup_old_versions(model_dir, keep=KEEP_VERSIONS)
+        print(f"[Model] ✓ 模型就绪: {target} ({total_bytes / 1e9:.2f} GB)")
+        return target, True
+
+
 def download_model_streaming(ps_url: str, save_path: Path, auth_token: Optional[str] = None) -> bool:
     """Download model using streaming to avoid memory spikes."""
     print("📥 Downloading model (streaming)...")
-    tmp_path = None
     
     try:
         with requests.get(
             f"{ps_url}/model",
             stream=True,
             headers=_auth_headers(auth_token),
-            timeout=30,
+            timeout=300, # 5min for cross-region shard download
         ) as resp:
             resp.raise_for_status()
             
@@ -952,13 +1087,6 @@ def download_model_streaming(ps_url: str, save_path: Path, auth_token: Optional[
         
     except Exception as e:
         print(f"❌ Model download failed: {e}")
-        # Clean up temp file on failure to prevent disk leaks
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-                print(f"🧹 Cleaned up temp file: {tmp_path}")
-            except OSError:
-                pass
         return False
 
 
@@ -1068,6 +1196,25 @@ def request_task_detailed(
         return None, "failed"
 
 
+def send_heartbeat(
+    ps_url: str,
+    miner_id: str,
+    capabilities: Dict,
+    auth_token: Optional[str] = None,
+) -> bool:
+    """Best-effort miner heartbeat to keep instance active."""
+    try:
+        resp = requests.post(
+            f"{ps_url}/heartbeat",
+            json={"miner_id": miner_id, "capabilities": capabilities},
+            headers=_auth_headers(auth_token),
+            timeout=5,
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
 def request_task_with_retry(
     ps_url: str,
     wallet_address: str,
@@ -1110,17 +1257,15 @@ def request_task_with_retry(
 def register_miner_with_retry(
     ps_url: str,
     wallet_address: str,
-    wallet_keypair: Optional[Any],
+    instance_id: Optional[str],
     capabilities: Dict[str, Any],
     retry_seconds: int = 30,
 ) -> Dict[str, Any]:
-    """
-    Register forever until success. Raises KeyboardInterrupt to allow graceful exit.
-    """
+    """Register forever until success."""
     attempt = 0
     while True:
         attempt += 1
-        register_response = register_miner(ps_url, wallet_address, wallet_keypair, capabilities)
+        register_response = register_miner(ps_url, wallet_address, instance_id, capabilities)
         if register_response:
             return register_response
         print(f"⚠️ PS unreachable, retrying in {retry_seconds}s... (attempt {attempt})")
@@ -1144,13 +1289,75 @@ def _best_layer_bucket(requested_layers: int, available_layers: List[int]) -> in
     return cleaned[-1]
 
 
+def _parse_base_urls(info: Dict[str, Any], fallback_base: str) -> List[str]:
+    urls: List[str] = []
+
+    # Preferred: explicit list from PS.
+    raw_list = info.get("base_urls")
+    if isinstance(raw_list, list):
+        for item in raw_list:
+            u = str(item or "").strip().rstrip("/")
+            if u and u not in urls:
+                urls.append(u)
+
+    # Backward compatible: single base_url; also allow comma-separated mirrors.
+    raw_base = str(info.get("base_url") or "").strip()
+    if raw_base:
+        for part in raw_base.split(","):
+            u = part.strip().rstrip("/")
+            if u and u not in urls:
+                urls.append(u)
+
+    fallback = str(fallback_base or "").strip().rstrip("/")
+    if fallback and fallback not in urls:
+        urls.append(fallback)
+
+    return urls
+
+
+def _stream_download_with_resume(file_url: str, tmp_path: Path, timeout_s: int = 600) -> int:
+    """Download file with HTTP Range resume support into tmp_path.
+
+    Returns current downloaded size in bytes (final file size on success).
+    """
+    downloaded = tmp_path.stat().st_size if tmp_path.exists() else 0
+    headers: Dict[str, str] = {}
+    mode = "wb"
+    if downloaded > 0:
+        headers["Range"] = f"bytes={downloaded}-"
+        mode = "ab"
+        print(f"   ↩️ Resuming from {downloaded / 1e9:.2f} GB")
+
+    with requests.get(file_url, headers=headers, stream=True, timeout=timeout_s) as resp:
+        if downloaded > 0 and resp.status_code == 200:
+            # Server ignored Range; restart from scratch to avoid corruption.
+            print("   ⚠️ Server ignored Range, restarting download from 0")
+            downloaded = 0
+            mode = "wb"
+        elif resp.status_code not in (200, 206):
+            resp.raise_for_status()
+
+        with open(tmp_path, mode) as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                downloaded += len(chunk)
+                if downloaded % (100 * 1024 * 1024) == 0:
+                    print(f"   Downloaded {downloaded / 1e9:.2f} GB...")
+    return downloaded
+
+
 def _download_partial_model_from_nginx(
     ps_url: str,
     assigned_layers: List[int],
     model_path: Path,
     auth_token: Optional[str] = None,
 ) -> Tuple[bool, int]:
-    """Try static file download via nginx using /model/info metadata."""
+    """Try static file download via nginx using /model/info metadata.
+
+    Supports multi-mirror fallback and resume via HTTP Range.
+    """
     info_resp = requests.get(
         f"{ps_url}/model/info",
         headers=_auth_headers(auth_token),
@@ -1159,71 +1366,48 @@ def _download_partial_model_from_nginx(
     info_resp.raise_for_status()
     info = info_resp.json()
 
-    base_url = str(info.get("base_url") or "").rstrip("/")
+    fallback_base = f"{ps_url.rstrip('/')}/models"
+    base_urls = _parse_base_urls(info, fallback_base)
+    if not base_urls:
+        raise RuntimeError("No static model base_url available")
+
     version = int(info.get("version", 0))
     available_layers = info.get("available_layers") or [4, 8, 12, 16, 20, 24, 32]
     bucket = _best_layer_bucket(len(assigned_layers), available_layers)
     file_name = f"v{version}_layers_0-{bucket-1}.pt"
-    file_url = f"{base_url}/{file_name}"
-    print(f"📥 Downloading static model from {file_url}")
-
-    remote_size = 0
-    with contextlib.suppress(Exception):
-        head = requests.head(file_url, timeout=10)
-        if head.status_code == 200:
-            remote_size = int(head.headers.get("content-length", "0") or 0)
-
-    # Cache hit: reuse same file if byte size matches.
-    if model_path.exists() and remote_size > 0:
-        local_size = model_path.stat().st_size
-        if remote_size == local_size:
-            _ = torch.load(model_path, map_location="cpu", mmap=True, weights_only=True)
-            print(f"✅ Reusing cached static model: {model_path.name}")
-            return True, local_size
 
     tmp_path = model_path.with_suffix(model_path.suffix + ".tmp")
-    resume_offset = tmp_path.stat().st_size if tmp_path.exists() else 0
-    req_headers = {}
-    if resume_offset > 0:
-        req_headers["Range"] = f"bytes={resume_offset}-"
-        print(
-            f"↩️ Resuming static download from offset {resume_offset:,}"
-            + (f" / {remote_size:,}" if remote_size > 0 else "")
-        )
 
-    with requests.get(file_url, headers=req_headers, stream=True, timeout=600) as resp:
-        if resp.status_code == 206 and resume_offset > 0:
-            mode = "ab"
-            content_range = resp.headers.get("Content-Range", "")
-            total_hint = content_range.split("/")[-1] if "/" in content_range else "?"
-            print(f"✅ HTTP 206 resume accepted ({resume_offset:,} -> total {total_hint})")
-        elif resp.status_code == 200:
-            if resume_offset > 0:
-                print("ℹ️ Server returned HTTP 200, restarting static download from byte 0")
-            mode = "wb"
-            resume_offset = 0
-        else:
-            resp.raise_for_status()
-            mode = "wb"
+    last_error: Optional[Exception] = None
+    for idx, base_url in enumerate(base_urls, start=1):
+        file_url = f"{base_url}/{file_name}"
+        print(f"📥 Static model source {idx}/{len(base_urls)}: {file_url}")
+        try:
+            # Cache hit: reuse same file if byte size matches.
+            if model_path.exists():
+                with contextlib.suppress(Exception):
+                    head = requests.head(file_url, timeout=10)
+                    if head.status_code == 200:
+                        remote_size = int(head.headers.get("content-length", "0") or 0)
+                        local_size = model_path.stat().st_size
+                        if remote_size > 0 and remote_size == local_size:
+                            _ = torch.load(model_path, map_location="cpu", mmap=True, weights_only=True)
+                            print(f"✅ Reusing cached static model: {model_path.name}")
+                            return True, local_size
 
-        resp.raise_for_status()
-        total_bytes = resume_offset
-        with open(tmp_path, mode) as f:
-            for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                if not chunk:
-                    continue
-                f.write(chunk)
-                total_bytes += len(chunk)
-                if total_bytes % (100 * 1024 * 1024) == 0:
-                    print(f"   Downloaded {total_bytes / 1e9:.2f} GB...")
+            total_bytes = _stream_download_with_resume(file_url, tmp_path, timeout_s=600)
+            _ = torch.load(tmp_path, map_location="cpu", mmap=True, weights_only=True)
+            os.replace(tmp_path, model_path)
+            return True, total_bytes
+        except Exception as exc:
+            last_error = exc
+            print(f"⚠️ Static source failed ({file_url}): {exc}")
+            # Keep tmp_path for resume on same URL retry in next outer attempt.
+            continue
 
-    print(
-        f"✅ Static file assembled: {total_bytes:,} bytes"
-        + (f" (expected ~{remote_size:,})" if remote_size > 0 else "")
-    )
-    _ = torch.load(tmp_path, map_location="cpu", mmap=True, weights_only=True)
-    os.replace(tmp_path, model_path)
-    return True, total_bytes
+    if last_error is not None:
+        raise last_error
+    return False, 0
 
 
 def download_partial_model_with_retry(
@@ -1240,8 +1424,6 @@ def download_partial_model_with_retry(
     Returns:
         (success, total_bytes)
     """
-    tmp_path = model_path.with_suffix(model_path.suffix + ".tmp")
-
     for attempt in range(1, max_attempts + 1):
         try:
             print(
@@ -1263,40 +1445,18 @@ def download_partial_model_with_retry(
             except Exception as static_err:
                 print(f"⚠️ Static model download failed, fallback to PS API: {static_err}")
 
-            # Fallback path: PS route with best-effort resume.
-            resume_offset = tmp_path.stat().st_size if tmp_path.exists() else 0
-            req_headers = _auth_headers(auth_token)
-            if resume_offset > 0:
-                req_headers["Range"] = f"bytes={resume_offset}-"
-                print(f"↩️ Resuming fallback /model/layers from offset {resume_offset:,}")
-
+            # Fallback path: existing PS route.
+            tmp_path = model_path.with_suffix(model_path.suffix + ".tmp")
             with requests.post(
                 f"{ps_url}/model/layers",
                 json={"assigned_layers": assigned_layers},
-                headers=req_headers,
+                headers=_auth_headers(auth_token),
                 stream=True,
                 timeout=600,
             ) as resp:
-                if resp.status_code == 206 and resume_offset > 0:
-                    mode = "ab"
-                    print("✅ Fallback endpoint accepted HTTP 206 resume")
-                elif resp.status_code == 200:
-                    if resume_offset > 0:
-                        print("ℹ️ Fallback endpoint returned HTTP 200, restarting from byte 0")
-                    mode = "wb"
-                    resume_offset = 0
-                elif resp.status_code == 416 and resume_offset > 0:
-                    print("ℹ️ Fallback resume offset invalid (416), clearing tmp and retrying")
-                    with contextlib.suppress(Exception):
-                        tmp_path.unlink()
-                    raise requests.HTTPError("HTTP 416 on fallback resume")
-                else:
-                    resp.raise_for_status()
-                    mode = "wb"
-
                 resp.raise_for_status()
-                total_bytes = resume_offset
-                with open(tmp_path, mode) as f:
+                total_bytes = 0
+                with open(tmp_path, "wb") as f:
                     for chunk in resp.iter_content(chunk_size=8192):
                         if not chunk:
                             continue
@@ -1311,6 +1471,10 @@ def download_partial_model_with_retry(
 
         except Exception as e:
             print(f"⚠️ Model download failed, retrying... ({attempt}/{max_attempts}) error={e}")
+            with contextlib.suppress(Exception):
+                tmp_path = model_path.with_suffix(model_path.suffix + ".tmp")
+                if tmp_path.exists():
+                    tmp_path.unlink()
             if attempt < max_attempts:
                 time.sleep(retry_delay)
 
@@ -1331,7 +1495,7 @@ def download_shard_streaming(ps_url: str, shard_id: int, auth_token: Optional[st
             f"{ps_url}/task/shard/{shard_id}",
             stream=True,
             headers=_auth_headers(auth_token),
-            timeout=30,
+            timeout=300, # 5min for cross-region shard download
         ) as resp:
             resp.raise_for_status()
             
@@ -1429,9 +1593,6 @@ def train_shard(
     raw_bytes_total = 0
     bad_param: Optional[str] = None
     sparse_parts: Dict[str, Dict[str, Any]] = {}
-    ef_residuals: Dict[str, torch.Tensor] = {}
-    if USE_ERROR_FEEDBACK:
-        print("INFO: EF enabled, residual buffers use lazy CPU allocation")
 
     while start_idx < num_sequences:
         # Create batch
@@ -1483,8 +1644,6 @@ def train_shard(
                     scaler=scaler,
                     grad_scale=float(grad_scale),
                     small_tensor_threshold=10000,
-                    use_error_feedback=USE_ERROR_FEEDBACK,
-                    residuals=ef_residuals,
                 )
                 try:
                     if (
@@ -1520,9 +1679,6 @@ def train_shard(
                     merged["values"].extend(bucket.get("values", []))
                 total_loss += loss.item()
                 num_batches += 1
-                if USE_ERROR_FEEDBACK and num_batches % 10 == 0 and ef_residuals:
-                    residual_norm = sum(float(torch.norm(r.float()).item()) for r in ef_residuals.values())
-                    print(f"[EF] step={num_batches} residual_norm={residual_norm:.6f}")
         except torch.cuda.OutOfMemoryError:
             if device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -1618,12 +1774,14 @@ def submit_gradient(
                 f"{ps_url}/task/complete",
                 json=payload,
                 headers=_auth_headers(auth_token),
-                timeout=120,
+                timeout=900,
             )
 
             if resp.status_code == 200:
                 result = resp.json()
-                print(f"✅ Gradient accepted! Score: {result.get('score', 'N/A'):.4f}")
+                score_val = result.get("score", "N/A")
+                score_str = f"{score_val:.4f}" if isinstance(score_val, (int, float)) else str(score_val)
+                print(f"✅ Gradient accepted! Score: {score_str}")
                 return True
 
             # 4xx usually means semantic rejection; no retry.
@@ -1650,76 +1808,16 @@ def submit_gradient(
     return False
 
 
-def _cleanup_stale_temp_files():
-    """Remove leftover .pt temp files from /tmp and .tmp model caches on startup."""
-    cleaned = 0
-
-    # 1. /tmp/*.pt — leaked by download_model_streaming (NamedTemporaryFile)
-    tmp_dir = Path(tempfile.gettempdir())
-    for f in tmp_dir.glob("tmp*.pt"):
-        try:
-            age_hours = (time.time() - f.stat().st_mtime) / 3600
-            if age_hours > 1:  # Only clean files older than 1 hour
-                size_mb = f.stat().st_size / (1024 * 1024)
-                f.unlink()
-                print(f"🧹 Cleaned stale temp: {f.name} ({size_mb:.0f} MB, {age_hours:.1f}h old)")
-                cleaned += 1
-        except OSError:
-            pass
-
-    # 2. *.pt.tmp — stale partial downloads next to model cache
-    cwd = Path.cwd()
-    for f in list(cwd.glob("*.pt.tmp")) + list(Path.home().glob(".alice/*.pt.tmp")):
-        try:
-            age_hours = (time.time() - f.stat().st_mtime) / 3600
-            if age_hours > 2:  # Partial downloads older than 2 hours are stale
-                size_mb = f.stat().st_size / (1024 * 1024)
-                f.unlink()
-                print(f"🧹 Cleaned stale partial: {f.name} ({size_mb:.0f} MB, {age_hours:.1f}h old)")
-                cleaned += 1
-        except OSError:
-            pass
-
-    if cleaned:
-        print(f"🧹 Startup cleanup: removed {cleaned} stale file(s)")
-    else:
-        print("✅ Startup cleanup: no stale files found")
-
-
-
-
-def _heartbeat_worker(ps_url: str, auth_token: str, interval: int = 300, stop_event: threading.Event = None):
-    """Background heartbeat to keep miner active on PS during long training."""
-    while not (stop_event and stop_event.is_set()):
-        try:
-            resp = requests.post(
-                f"{ps_url}/heartbeat",
-                headers={"Authorization": f"Bearer {auth_token}"},
-                json={"status": "training"},
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                pass  # silent success
-            else:
-                print(f"⚠️ Heartbeat returned {resp.status_code}")
-        except (requests.RequestException, ConnectionError, TimeoutError):
-            pass  # Do not crash on heartbeat failure
-
-        # Sleep in small chunks so stop_event is responsive
-        for _ in range(interval):
-            if stop_event and stop_event.is_set():
-                break
-            time.sleep(1)
 def main():
     parser = argparse.ArgumentParser(description="Alice Miner V2 - Tiered Training")
     parser.add_argument("--ps-url", required=True, help="Parameter server URL")
-    parser.add_argument("--wallet", default=None, help="Wallet address override (debug only)")
-    parser.add_argument("--wallet-path", type=Path, default=DEFAULT_WALLET_PATH, help="Wallet file path")
+    parser.add_argument("--address", required=True, help="Miner reward/identity address (a1...)")
+    parser.add_argument("--instance-id", default=None, help="Optional miner instance id (for multi-GPU)")
     parser.add_argument(
         "--allow-insecure",
         action="store_true",
         default=False,
-        help="Allow insecure HTTP connections and wallet bypass (dev/testing only)",
+        help="Allow insecure HTTP connections (dev/testing only)",
     )
     parser.add_argument(
         "--batch-size",
@@ -1736,7 +1834,15 @@ def main():
     parser.add_argument("--seq-len", type=int, default=128, help="Sequence length")
     parser.add_argument("--max-batches", type=int, default=10, help="Max batches per shard")
     parser.add_argument("--model-path", type=Path, default=None, help="Pre-downloaded model path (skip download)")
+    parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR, help="Model cache directory (default: ~/.alice/models)")
     parser.add_argument("--device", default=None, help="Training device override: cuda|mps|cpu")
+    parser.add_argument(
+        "--reward-address",
+        default=None,
+        help="Separate address for receiving ALICE rewards (optional). "
+             "If not set, rewards go to --address. "
+             "Use this on cloud GPUs to keep main wallet safe."
+    )
     parser.add_argument(
         "--precision",
         default="auto",
@@ -1745,6 +1851,14 @@ def main():
     )
     args = parser.parse_args()
     args.ps_url = str(args.ps_url).strip().rstrip("/")
+
+    # Fail fast if model runtime is missing; avoids wasting time downloading 13GB then crashing.
+    if not ALICE_MODEL_AVAILABLE:
+        print("[ERROR] Missing model runtime: src.model (AliceConfig/AliceForCausalLM)")
+        if ALICE_MODEL_IMPORT_ERROR:
+            print(f"[ERROR] Import detail: {ALICE_MODEL_IMPORT_ERROR}")
+        print("[ERROR] Re-download latest miner package and retry.")
+        sys.exit(1)
 
     ps_url_lower = args.ps_url.lower()
     if ps_url_lower.startswith("https://"):
@@ -1759,24 +1873,15 @@ def main():
         print("[ERROR] PS URL must start with https:// (or http:// with --allow-insecure).")
         sys.exit(1)
 
-    # Load wallet
-    wallet_keypair: Optional[Any] = None
-    if args.wallet:
-        if not args.allow_insecure:
-            print("[ERROR] --wallet bypass requires --allow-insecure. Use encrypted wallet for production.")
-            sys.exit(1)
-        wallet_address = args.wallet
-        print("[WARNING] ⚠️ Using raw wallet address bypass. This is NOT secure for production!")
-        logging.warning("Wallet bypass used: %s...", str(wallet_address)[:8])
-    else:
-        try:
-            wallet = get_or_create_wallet_for_miner(args.wallet_path)
-        except RuntimeError as exc:
-            print(str(exc))
-            return
-        wallet_address = wallet.address
-        wallet_keypair = wallet.to_keypair()
-        del wallet
+    # Miner identity address (no local wallet/private key required)
+    wallet_address = str(args.address or "").strip()
+    if not wallet_address:
+        print("[ERROR] --address is required")
+        sys.exit(1)
+    if not wallet_address.startswith("a"):
+        print("[ERROR] --address must look like an Alice address (prefix 'a')")
+        sys.exit(1)
+    miner_instance_id = str(args.instance_id).strip() if args.instance_id else None
 
     # Hold process-wide non-blocking file lock to prevent duplicate miners.
     _lock_fp = acquire_single_instance_lock()
@@ -1789,19 +1894,9 @@ def main():
     gradients_rejected = 0
     profile_path = device_profile_path()
 
-    # Startup cleanup: remove stale temp files from previous crashed downloads.
-    _cleanup_stale_temp_files()
-
-    # Heartbeat state (managed across re-registration loops).
-    heartbeat_stop: Optional[threading.Event] = None
-
     # Never exit on transient errors; only Ctrl+C stops the miner.
     while True:
         try:
-            # Stop previous heartbeat if re-registering.
-            if heartbeat_stop is not None:
-                heartbeat_stop.set()
-                heartbeat_stop = None
             # Get hardware capabilities (auto-detect unless overridden).
             capabilities = get_hardware_info(args.device)
             profile_key = device_profile_key(wallet_address, capabilities)
@@ -1821,50 +1916,25 @@ def main():
             oom_abort_streak = 0
             upgraded_this_run = False
 
-            # === Aggregator node assignment ===
-            effective_ps_url = args.ps_url
-            try:
-                log.info(f"Requesting node assignment from {args.ps_url}...")
-                assign_resp = requests.get(
-                    f"{args.ps_url}/node/assign",
-                    timeout=10,
-                )
-                if assign_resp.status_code == 200:
-                    assign_data = assign_resp.json()
-                    if assign_data.get("status") == "ok" and assign_data.get("aggregator_url"):
-                        effective_ps_url = assign_data["aggregator_url"]
-                        print(f"📡 Assigned to aggregator: {effective_ps_url}")
-                    else:
-                        print(f"📡 Direct PS mode")
-                else:
-                    print(f"📡 Node assignment unavailable (HTTP {assign_resp.status_code}), using PS directly")
-            except Exception as e:
-                print(f"⚠️ Node assignment failed: {e}, using PS directly")
-            args.ps_url = effective_ps_url
-
             # Registration retry forever.
+            # Inject reward address if specified (separates signing wallet from reward destination)
+            if args.reward_address:
+                capabilities["reward_address"] = args.reward_address
+                print(f"💰 Reward address: {args.reward_address[:12]}...")
+
             register_response = register_miner_with_retry(
                 args.ps_url,
                 wallet_address,
-                wallet_keypair,
+                miner_instance_id,
                 capabilities,
                 retry_seconds=30,
             )
+            miner_instance_id = str(register_response.get("instance_id") or register_response.get("miner_id") or miner_instance_id or wallet_address)
             auth_token = str(register_response.get("token", "")).strip()
             if not auth_token:
                 print("❌ Registration succeeded but no auth token returned; retrying in 30s...")
                 time.sleep(30)
                 continue
-
-            # Start heartbeat thread
-            heartbeat_stop = threading.Event()
-            heartbeat_thread = threading.Thread(
-                target=_heartbeat_worker,
-                args=(args.ps_url, auth_token, 300, heartbeat_stop),
-                daemon=True,
-            )
-            heartbeat_thread.start()
-            print("💓 Heartbeat started (every 5min)")
 
             # Use first assigned task to learn layer assignment + model version.
             print("📥 Requesting task to get layer assignment...")
@@ -1872,7 +1942,7 @@ def main():
             while pending_task is None:
                 task, status = request_task_with_retry(
                     args.ps_url,
-                    wallet_address,
+                    miner_instance_id,
                     capabilities,
                     auth_token=auth_token,
                     retry_delay=15,
@@ -1882,6 +1952,7 @@ def main():
                     pending_task = task
                     break
                 if status == "no_task":
+                    send_heartbeat(args.ps_url, miner_instance_id, capabilities, auth_token=auth_token)
                     time.sleep(10)
                     continue
                 if status == "re_register":
@@ -1898,95 +1969,22 @@ def main():
             print(f"   📋 Assigned layers: {assigned_layers}")
             print(f"   📋 PS model version: {ps_version}")
 
-            # Download partial model (only assigned layers) with version caching
-            # Use --model-path location when provided (even if file not yet exists)
-            if args.model_path:
+            # Download/cache model (shared per host, versioned)
+            if args.model_path and args.model_path.exists():
                 model_path = args.model_path
-                model_path.parent.mkdir(parents=True, exist_ok=True)
-                if model_path.exists():
-                    print(f"📁 Using pre-downloaded model: {model_path}")
-                    need_download = False
-                else:
-                    print(f"📁 Using custom model cache path: {model_path}")
-                    need_download = True
+                print(f"📁 Using pre-downloaded model: {model_path}")
             else:
-                model_path = Path("./miner_model_partial.pt")
-                need_download = True
-            # Keep metadata next to model cache to avoid cwd mismatch issues.
-            meta_path = model_path.with_name("miner_model_meta.json")
-
-            # Check if cached model is still valid
-            if model_path.exists() and meta_path.exists():
-                try:
-                    with open(meta_path, "r") as f:
-                        meta = json.load(f)
-                    local_version = meta.get("version", -1)
-                    local_layers = meta.get("layers", [])
-                    if local_version == ps_version and local_layers == assigned_layers:
-                        print(f"✅ Cached model valid (version {local_version}, {len(local_layers)} layers)")
-                        need_download = False
-                    elif local_version + 1 == ps_version and local_layers == assigned_layers:
-                        # Try delta update
-                        print(f"🔄 Attempting delta update (v{local_version} → v{ps_version})...")
-                        delta_resp = request_delta_update(
-                            args.ps_url,
-                            local_version,
-                            auth_token=auth_token,
-                        )
-
-                        if delta_resp and delta_resp.get("status") == "ok":
-                            delta_data = delta_resp.get("delta")
-                            delta_mb = delta_resp.get("_payload_bytes", 0) / (1024 * 1024)
-                            meta = delta_resp.get("metadata", {})
-                            selected_params = int(meta.get("selected_params", 0))
-                            print(
-                                f"   📦 Delta received: {delta_mb:.2f}MB, "
-                                f"applying to {selected_params} parameters"
-                            )
-                            if apply_delta_update(model_path, delta_data, local_version, ps_version):
-                                with open(meta_path, "w") as f:
-                                    json.dump({"version": ps_version, "layers": assigned_layers}, f)
-                                print(f"✅ Delta update successful! Now at version {ps_version}")
-                                need_download = False
-                            else:
-                                print("⚠️ Delta apply failed, falling back to full download")
-                                need_download = True
-                        elif delta_resp and delta_resp.get("status") == "no_changes":
-                            with open(meta_path, "w") as f:
-                                json.dump({"version": ps_version, "layers": assigned_layers}, f)
-                            print(f"✅ No changes, updated version to {ps_version}")
-                            need_download = False
-                        else:
-                            print("⚠️ Delta not available, falling back to full download")
-                            need_download = True
-                    else:
-                        print(
-                            f"⚠️ Cache outdated: local v{local_version} vs PS v{ps_version} "
-                            "(gap too large or layers changed)"
-                        )
-                        need_download = True
-                except (OSError, json.JSONDecodeError, ValueError):
-                    print("⚠️ Could not read cache metadata, will re-download")
-                    need_download = True
-
-            if need_download:
-                ok, total_bytes = download_partial_model_with_retry(
-                    args.ps_url,
+                model_path, changed = ensure_cached_model(
+                    ps_url=args.ps_url,
+                    ps_version=int(ps_version),
                     assigned_layers=assigned_layers,
-                    model_path=model_path,
+                    model_dir=Path(args.model_dir),
                     auth_token=auth_token,
-                    max_attempts=3,
-                    retry_delay=10,
                 )
-                if not ok:
-                    print("❌ Model download failed after retries, restarting in 30s...")
-                    time.sleep(30)
-                    continue
-                with open(meta_path, "w") as f:
-                    json.dump({"version": ps_version, "layers": assigned_layers}, f)
-                print(f"✅ Partial model downloaded: {total_bytes / 1e9:.2f} GB (version {ps_version})")
-            else:
-                print(f"✅ Using cached model: {model_path}")
+                if changed:
+                    print(f"✅ Cached model updated to v{ps_version}: {model_path}")
+                else:
+                    print(f"✅ Using cached model: {model_path}")
 
             # Load state_dict to detect assigned_layers if not set
             print("📦 Loading partial model...")
@@ -2230,13 +2228,14 @@ def main():
                 else:
                     task, status = request_task_with_retry(
                         args.ps_url,
-                        wallet_address,
+                        miner_instance_id,
                         capabilities,
                         auth_token=auth_token,
                         retry_delay=15,
                         max_attempts=5,
                     )
                     if status == "no_task":
+                        send_heartbeat(args.ps_url, miner_instance_id, capabilities, auth_token=auth_token)
                         time.sleep(10)
                         continue
                     if status == "re_register" or task is None:
@@ -2449,7 +2448,7 @@ def main():
                                 register_miner_with_retry(
                                     args.ps_url,
                                     wallet_address,
-                                    wallet_keypair,
+                                    miner_instance_id,
                                     retry_caps,
                                     retry_seconds=30,
                                 )
@@ -2471,10 +2470,6 @@ def main():
 
         except KeyboardInterrupt:
             print("\n🛑 Miner stopped by user")
-            try:
-                heartbeat_stop.set()
-            except Exception:
-                pass
             return
         except Exception as e:
             print(f"❌ Unexpected error: {e}. Restarting in 30s...")
