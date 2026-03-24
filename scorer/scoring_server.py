@@ -108,7 +108,7 @@ def load_model(model_path: str, device: str) -> torch.nn.Module:
     config = AliceConfig()
     model = AliceForCausalLM(config)
 
-    checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+    checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
     # Handle both raw state_dict and wrapped checkpoint
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     model.load_state_dict(state_dict, strict=False)
@@ -159,7 +159,7 @@ def load_validation_shards(
 
     for sf in files:
         try:
-            data = torch.load(sf, map_location="cpu", weights_only=False)
+            data = torch.load(sf, map_location="cpu", weights_only=True)
             if isinstance(data, dict) and "tokens" in data:
                 data = data["tokens"]
             shards.append(data)
