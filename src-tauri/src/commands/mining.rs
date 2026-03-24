@@ -4,6 +4,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use tauri::{Manager, State};
 
+use super::setup;
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum MiningStatus {
     Idle,
@@ -50,7 +52,7 @@ impl Default for MiningProcess {
 
 pub type MiningProcessState = Mutex<MiningProcess>;
 
-/// Try to find the bundled miner binary; fall back to Python.
+/// Try to find the bundled miner binary; fall back to venv Python.
 fn get_miner_command() -> (String, Vec<String>) {
     let exe_dir = std::env::current_exe()
         .ok()
@@ -67,7 +69,19 @@ fn get_miner_command() -> (String, Vec<String>) {
         return (binary_path.to_string_lossy().to_string(), vec![]);
     }
 
-    // Fallback: use Python
+    // Use venv Python with alice-node code directory
+    if let (Ok(venv_dir), Ok(code_dir)) = (setup::get_venv_dir(), setup::get_code_dir()) {
+        let python = setup::venv_python(&venv_dir);
+        let script = code_dir.join("alice_node.py");
+        if python.exists() && script.exists() {
+            return (
+                python.to_string_lossy().to_string(),
+                vec![script.to_string_lossy().to_string()],
+            );
+        }
+    }
+
+    // Last resort fallback: system Python
     #[cfg(target_os = "windows")]
     let python = "python";
     #[cfg(not(target_os = "windows"))]
@@ -80,6 +94,7 @@ fn get_miner_command() -> (String, Vec<String>) {
 pub fn start_mining(
     wallet_address: String,
     gpu_index: u32,
+    device: Option<String>,
     state: State<'_, MiningProcessState>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
@@ -93,6 +108,17 @@ pub fn start_mining(
     process.state.wallet_address = Some(wallet_address.clone());
     process.state.gpu_index = gpu_index;
 
+    // Determine device: use frontend-provided value, or infer from gpu_index
+    let device_str = device.unwrap_or_else(|| {
+        if gpu_index == 999 {
+            "cpu".to_string()
+        } else if cfg!(target_os = "macos") {
+            "mps".to_string()
+        } else {
+            "cuda".to_string()
+        }
+    });
+
     let (program, prefix_args) = get_miner_command();
     let mut cmd = Command::new(&program);
     for arg in &prefix_args {
@@ -100,11 +126,10 @@ pub fn start_mining(
     }
     cmd.arg("--ps-url")
         .arg("https://ps.aliceprotocol.org")
-        .arg("--wallet")
+        .arg("--address")
         .arg(&wallet_address)
         .arg("--device")
-        .arg(if gpu_index == 999 { "cpu".to_string() } else { "cuda".to_string() })
-        .arg("--allow-insecure")
+        .arg(&device_str)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -144,7 +169,7 @@ pub fn start_mining(
 
             process.child = Some(child);
             process.state.status = MiningStatus::Running;
-            log::info!("Mining started for wallet {} on GPU {}", wallet_address, gpu_index);
+            log::info!("Mining started for address {} on device {} (gpu_index={})", wallet_address, device_str, gpu_index);
             Ok(())
         }
         Err(e) => {

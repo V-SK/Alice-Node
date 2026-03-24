@@ -4,6 +4,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use tauri::{Manager, State};
 
+use super::setup;
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum ScoringStatus {
     Idle,
@@ -68,6 +70,19 @@ fn get_scorer_command() -> (String, Vec<String>) {
         return (binary_path.to_string_lossy().to_string(), vec!["score".to_string()]);
     }
 
+    // Use venv Python with alice-node code directory
+    if let (Ok(venv_dir), Ok(code_dir)) = (setup::get_venv_dir(), setup::get_code_dir()) {
+        let python = setup::venv_python(&venv_dir);
+        let script = code_dir.join("alice_node.py");
+        if python.exists() && script.exists() {
+            return (
+                python.to_string_lossy().to_string(),
+                vec![script.to_string_lossy().to_string(), "score".to_string()],
+            );
+        }
+    }
+
+    // Last resort fallback: system Python
     #[cfg(target_os = "windows")]
     let python = "python";
     #[cfg(not(target_os = "windows"))]
@@ -92,7 +107,7 @@ pub fn start_scoring(
     process.state.wallet_address = Some(wallet_address.clone());
 
     let (program, mut args) = get_scorer_command();
-    args.extend(["--wallet".to_string(), wallet_address.clone()]);
+    args.extend(["--address".to_string(), wallet_address.clone()]);
     args.extend(["--ps-url".to_string(), "https://ps.aliceprotocol.org".to_string()]);
 
     let mut cmd = Command::new(&program);
@@ -135,7 +150,7 @@ pub fn start_scoring(
 
             process.child = Some(child);
             process.state.status = ScoringStatus::Running;
-            log::info!("Scoring started for wallet {}", wallet_address);
+            log::info!("Scoring started for address {}", wallet_address);
             Ok(())
         }
         Err(e) => {

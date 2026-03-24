@@ -103,6 +103,8 @@ fn main() {
             commands::staking::stake,
             commands::staking::unstake,
             commands::staking::get_staking_info,
+            // Setup
+            commands::setup::auto_setup,
         ])
         .manage(std::sync::Mutex::new(commands::mining::MiningProcess::default()))
         .manage(std::sync::Mutex::new(commands::scoring::ScoringProcess::default()))

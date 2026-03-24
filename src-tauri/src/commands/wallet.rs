@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 const ALICE_SS58_PREFIX: u16 = 300;
 const KEYRING_SERVICE: &str = "alice-miner";
@@ -25,32 +26,44 @@ pub fn generate_wallet() -> Result<WalletInfo, String> {
     // Generate 12-word mnemonic
     let mnemonic = Mnemonic::generate_in(Language::English, 12).map_err(|e| e.to_string())?;
 
+    let mut mnemonic_string = mnemonic.to_string();
+
     // Derive SR25519 keypair
     let (pair, _) =
-        sr25519::Pair::from_phrase(&mnemonic.to_string(), None).map_err(|e| format!("{:?}", e))?;
+        sr25519::Pair::from_phrase(&mnemonic_string, None).map_err(|e| format!("{:?}", e))?;
 
     // Generate Alice Protocol address (SS58 prefix = 300)
     let address = pair
         .public()
         .to_ss58check_with_version(ALICE_SS58_PREFIX.into());
 
-    Ok(WalletInfo {
+    let result = WalletInfo {
         address,
-        mnemonic: Some(mnemonic.to_string()),
-    })
+        mnemonic: Some(mnemonic_string.clone()),
+    };
+
+    // Securely zero out mnemonic from memory
+    mnemonic_string.zeroize();
+
+    Ok(result)
 }
 
 #[tauri::command]
 pub fn import_wallet(mnemonic: String) -> Result<WalletInfo, String> {
     use sp_core::{crypto::Ss58Codec, sr25519, Pair};
 
+    let mut mnemonic_owned = mnemonic;
+
     // Validate and derive keypair from mnemonic
     let (pair, _) =
-        sr25519::Pair::from_phrase(&mnemonic.trim(), None).map_err(|_| "Invalid mnemonic phrase")?;
+        sr25519::Pair::from_phrase(mnemonic_owned.trim(), None).map_err(|_| "Invalid mnemonic phrase")?;
 
     let address = pair
         .public()
         .to_ss58check_with_version(ALICE_SS58_PREFIX.into());
+
+    // Securely zero out mnemonic from memory
+    mnemonic_owned.zeroize();
 
     Ok(WalletInfo {
         address,
