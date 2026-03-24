@@ -208,16 +208,18 @@ fn auto_restart_miner(
     let max_restarts: u32 = 5;
     let restart_delay = std::time::Duration::from_secs(10);
 
-    // Helper to lock the managed state
-    let lock_state = || -> Result<std::sync::MutexGuard<MiningProcess>, ()> {
-        app_handle.state::<MiningProcessState>().inner().lock().map_err(|_| ())
-    };
+    // Macro to lock managed state — avoids closure lifetime issues (E0515)
+    macro_rules! lock_state {
+        () => {
+            app_handle.state::<MiningProcessState>().inner().lock().map_err(|_| ())
+        };
+    }
 
     // Wait for the initial process to finish
     loop {
         std::thread::sleep(std::time::Duration::from_secs(2));
 
-        let mut process = match lock_state() {
+        let mut process = match lock_state!() {
             Ok(p) => p,
             Err(_) => return,
         };
@@ -252,7 +254,7 @@ fn auto_restart_miner(
                 let _ = app_handle.emit_all("miner-error", serde_json::json!({
                     "message": format!("Miner crashed {} times. Auto-restart stopped.", max_restarts)
                 }));
-                if let Ok(mut p) = lock_state() {
+                if let Ok(mut p) = lock_state!() {
                     p.state.status = MiningStatus::Error;
                     p.state.error_message = Some(format!(
                         "Miner crashed {} times. Please check logs and restart manually.",
@@ -276,7 +278,7 @@ fn auto_restart_miner(
             std::thread::sleep(restart_delay);
 
             // Check if user stopped mining while we were waiting
-            if let Ok(p) = lock_state() {
+            if let Ok(p) = lock_state!() {
                 if p.state.status == MiningStatus::Idle || p.state.status == MiningStatus::Stopping {
                     return;
                 }
@@ -328,7 +330,7 @@ fn auto_restart_miner(
                         });
                     }
 
-                    if let Ok(mut p) = lock_state() {
+                    if let Ok(mut p) = lock_state!() {
                         p.child = Some(child);
                         p.state.status = MiningStatus::Running;
                     }
@@ -338,7 +340,7 @@ fn auto_restart_miner(
                     // Wait for this instance to exit
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(2));
-                        let mut process = match lock_state() {
+                        let mut process = match lock_state!() {
                             Ok(p) => p,
                             Err(_) => return,
                         };
