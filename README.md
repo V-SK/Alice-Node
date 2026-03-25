@@ -100,6 +100,26 @@ The old `Alice-Miner` repo has been renamed to `Alice-Node`:
 
 **Recommended:** Use `python alice_node.py mine` — the new unified CLI.
 
+## Multi-GPU Mining
+
+Have multiple GPUs? One command launches a miner on every card:
+
+```bash
+export ALICE_ADDRESS="your_wallet_address"
+./start_multi_gpu.sh
+```
+
+Model downloads once, shared across all GPUs. Each GPU runs an independent miner process.
+
+```bash
+./start_multi_gpu.sh --gpus 0,1,2,3    # Specific GPUs
+./start_multi_gpu.sh --gpus 0-7         # Range
+./stop_multi_gpu.sh                     # Stop all
+tail -f ~/.alice/logs/miner-gpu*.log    # Monitor
+```
+
+**Requirements:** NVIDIA GPUs with 24GB+ VRAM each.
+
 ## Desktop App (Optional)
 
 A desktop GUI is available for miners who prefer a graphical interface.
