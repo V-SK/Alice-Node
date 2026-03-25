@@ -34,7 +34,10 @@ from torch.utils.data import DataLoader, TensorDataset
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
-from core.model import LlamaNanoModel, LlamaNanoConfig
+try:
+    from core.model import LlamaNanoModel, LlamaNanoConfig
+except ImportError:
+    from core.model import AliceForCausalLM as LlamaNanoModel, AliceConfig as LlamaNanoConfig
 from core.compression import TopKCompressor
 try:
     from src.model import AliceConfig, AliceForCausalLM
