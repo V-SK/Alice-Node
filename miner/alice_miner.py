@@ -34,10 +34,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
-try:
-    from core.model import LlamaNanoModel, LlamaNanoConfig
-except ImportError:
-    from core.model import AliceForCausalLM as LlamaNanoModel, AliceConfig as LlamaNanoConfig
+from core.model import AliceForCausalLM, AliceConfig
 from core.compression import TopKCompressor
 try:
     from src.model import AliceConfig, AliceForCausalLM
@@ -433,7 +430,7 @@ def setup_tiered_training(model: nn.Module, assigned_layers: List[int], n_layers
     Setup tiered training: freeze unassigned layers, enable gradient checkpointing.
     
     Args:
-        model: LlamaNanoModel
+        model: AliceForCausalLM
         assigned_layers: List of layer indices to train
         n_layers: Total number of layers in model
     """
@@ -449,7 +446,7 @@ def setup_tiered_training(model: nn.Module, assigned_layers: List[int], n_layers
     if hasattr(model, 'model') and hasattr(model.model, 'layers'):
         layers_container = model.model.layers  # AliceForCausalLM
     elif hasattr(model, 'layers'):
-        layers_container = model.layers  # LlamaNanoModel
+        layers_container = model.layers  # AliceForCausalLM
     else:
         layers_container = None
     
@@ -479,7 +476,7 @@ def setup_tiered_training(model: nn.Module, assigned_layers: List[int], n_layers
 def _assigned_layer_prefixes(model: nn.Module, assigned_layers: List[int]) -> List[str]:
     if hasattr(model, 'model') and hasattr(model.model, 'layers'):
         return [f"model.layers.{i}." for i in assigned_layers]  # AliceForCausalLM
-    return [f"layers.{i}." for i in assigned_layers]  # LlamaNanoModel
+    return [f"layers.{i}." for i in assigned_layers]  # AliceForCausalLM
 
 
 def _torch_version_at_least(major: int, minor: int) -> bool:
@@ -1539,7 +1536,7 @@ def train_shard(
     Backward pass only computes gradients for unfrozen (assigned) layers.
     
     Args:
-        model: LlamaNanoModel
+        model: AliceForCausalLM
         shard_data: {'tokens': tensor, 'shard_id': int, 'num_tokens': int}
         device: Training device
         assigned_layers: List of layer indices to train

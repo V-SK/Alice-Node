@@ -363,3 +363,7 @@ if __name__ == "__main__":
     print("  ✅ Gradients computed successfully")
     
     print("\n✅ Alice-7B model definition complete!")
+
+# Backward compatibility aliases (DO NOT USE in new code)
+LlamaNanoConfig = AliceConfig
+LlamaNanoModel = AliceForCausalLM
