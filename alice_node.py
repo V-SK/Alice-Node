@@ -53,6 +53,12 @@ def cmd_mine(args):
         sys.argv += ["--batch-size", str(args.batch_size)]
     if args.model_path:
         sys.argv += ["--model-path", args.model_path]
+    if args.model_dir:
+        sys.argv += ["--model-dir", args.model_dir]
+    if args.instance_id:
+        sys.argv += ["--instance-id", args.instance_id]
+    if args.download_only:
+        sys.argv += ["--download-only"]
     miner_main()
 
 
@@ -138,6 +144,9 @@ Learn more: https://aliceprotocol.org
     p_mine.add_argument("--device", help="Force device: cuda, mps, cpu")
     p_mine.add_argument("--batch-size", type=int, help="Training batch size")
     p_mine.add_argument("--model-path", help="Path to model weights (skip download)")
+    p_mine.add_argument("--model-dir", help="Model cache directory (default: ~/.alice/models)")
+    p_mine.add_argument("--instance-id", help="Miner instance ID (for multi-GPU)")
+    p_mine.add_argument("--download-only", action="store_true", help="Download model and exit")
     p_mine.set_defaults(func=cmd_mine)
 
     # ── Score ─────────────────────────────────────────────────────────
