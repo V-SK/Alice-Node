@@ -86,8 +86,10 @@ python alice_node.py mine
 - **Total Supply:** 21,000,000 ALICE (fixed, never inflated)
 - **Year 1–2 Budget:** 5,250,000 ALICE/year, halving every 2 years
 - **Per-Round Reward:** ~600 ALICE (each round ≈ 60 minutes)
-- **Miner Share:** 56–90% (dynamic)
-- **Infrastructure:** 9% (Scorers 5% + Aggregators 2% + Scheduler 2%)
+- **Miners:** 90%
+- **Scorers:** 3%
+- **Aggregators:** 4%
+- **Parameter Server:** 3%
 
 ## Upgrading from Alice-Miner
 
