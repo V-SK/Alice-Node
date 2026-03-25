@@ -166,7 +166,7 @@ device = 'cpu'
 mem = 'N/A'
 if torch.cuda.is_available():
     device = f'CUDA ({torch.cuda.get_device_name(0)})'
-    mem = f'{torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB'
+    mem = f'{torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB'
 elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     device = 'MPS (Apple Silicon)'
     import subprocess
