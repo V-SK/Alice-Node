@@ -1811,7 +1811,7 @@ def submit_gradient(
 def main():
     parser = argparse.ArgumentParser(description="Alice Miner V2 - Tiered Training")
     parser.add_argument("--ps-url", required=True, help="Parameter server URL")
-    parser.add_argument("--address", required=True, help="Miner reward/identity address (a1...)")
+    parser.add_argument("--address", default=None, help="Miner reward/identity address (auto-reads ~/.alice/wallet.json if omitted)")
     parser.add_argument("--instance-id", default=None, help="Optional miner instance id (for multi-GPU)")
     parser.add_argument(
         "--allow-insecure",
@@ -1850,6 +1850,25 @@ def main():
         help="Precision mode selection",
     )
     args = parser.parse_args()
+
+    # Auto-read address from local wallet if not provided
+    if not args.address:
+        import json as _json
+        _wallet_path = os.path.expanduser("~/.alice/wallet.json")
+        if os.path.exists(_wallet_path):
+            try:
+                with open(_wallet_path) as _wf:
+                    _wallet = _json.load(_wf)
+                    args.address = _wallet.get("address")
+                    if args.address:
+                        print(f"📋 Using address from ~/.alice/wallet.json: {args.address[:16]}...")
+            except Exception:
+                pass
+        if not args.address:
+            print("❌ No address provided and no wallet found.")
+            print("   Run: python3 alice_node.py wallet create")
+            print("   Or:  python3 alice_node.py mine --address YOUR_ADDRESS")
+            sys.exit(1)
     args.ps_url = str(args.ps_url).strip().rstrip("/")
 
     # Fail fast if model runtime is missing; avoids wasting time downloading 13GB then crashing.
