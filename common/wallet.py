@@ -46,8 +46,8 @@ def _balance(wallet_path: Path = DEFAULT_WALLET_PATH):
         substrate = SubstrateInterface(url=rpc_url)
         result = substrate.query("System", "Account", [address])
         free = result.value["data"]["free"]
-        # Convert from smallest unit (1 ALICE = 10^18 planck)
-        balance_alice = free / 10**18
+        # Convert from smallest unit (1 ALICE = 10^12 planck)
+        balance_alice = free / 10**12
         print(f"💰 Balance: {balance_alice:,.4f} ALICE")
         print(f"🔗 RPC: {rpc_url}")
     except ImportError:

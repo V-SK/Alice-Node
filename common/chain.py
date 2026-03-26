@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 DEFAULT_RPC_URL = "wss://rpc.aliceprotocol.org"
-PLANCK = 10**18  # 1 ALICE = 10^18 planck
+PLANCK = 10**12  # 1 ALICE = 10^12 planck
 
 # Staking requirements (in ALICE)
 STAKE_REQUIREMENTS = {
