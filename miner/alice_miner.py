@@ -376,6 +376,62 @@ def _auth_headers(auth_token: Optional[str]) -> Dict[str, str]:
     return {"Authorization": f"Bearer {auth_token}"}
 
 
+def _normalize_base_url(url: str) -> str:
+    return str(url or "").strip().rstrip("/")
+
+
+def discover_work_endpoint(
+    control_ps_url: str,
+    timeout: int = 5,
+    miner_hint: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Resolve the current miner-facing endpoint via PS /node/assign."""
+    control_url = _normalize_base_url(control_ps_url)
+    direct_result = {
+        "control_url": control_url,
+        "work_url": control_url,
+        "mode": "direct",
+        "node_id": None,
+    }
+    try:
+        params = {"wallet": miner_hint} if miner_hint else None
+        resp = requests.get(f"{control_url}/node/assign", params=params, timeout=timeout)
+        if resp.status_code != 200:
+            print(f"⚠️ Discovery failed: {resp.status_code} {resp.text[:160]}")
+            return direct_result
+
+        data = resp.json()
+        status = str(data.get("status", "")).strip().lower()
+        if status == "ok":
+            work_url = _normalize_base_url(data.get("aggregator_url"))
+            if work_url:
+                node_id = str(data.get("node_id", "")).strip() or None
+                label = f" (node_id={node_id})" if node_id else ""
+                print(f"🔀 Discovery: using aggregator {work_url}{label}")
+                return {
+                    "control_url": control_url,
+                    "work_url": work_url,
+                    "mode": "aggregator",
+                    "node_id": node_id,
+                }
+            print("⚠️ Discovery returned status=ok but aggregator_url missing, using PS directly")
+            return direct_result
+
+        if status == "direct":
+            message = str(data.get("message", "")).strip()
+            if message:
+                print(f"🔀 Discovery: {message}")
+            else:
+                print("🔀 Discovery: using PS directly")
+            return direct_result
+
+        print(f"⚠️ Discovery returned unexpected payload: {data}")
+    except Exception as e:
+        print(f"⚠️ Discovery error: {e}")
+
+    return direct_result
+
+
 def register_miner(
     ps_url: str,
     wallet_address: str,
@@ -1156,6 +1212,7 @@ def request_task_detailed(
         - "ok": task available
         - "no_task": PS has no task currently
         - "failed": request/network error
+        - "re_register": auth/session invalid, caller should re-register
     """
     try:
         resp = requests.post(
@@ -1188,6 +1245,10 @@ def request_task_detailed(
             print(f"   {error.get('message', '')}")
             return None, "failed"
 
+        if resp.status_code in (401, 403):
+            print(f"⚠️ Task request unauthorized: {resp.status_code} {resp.text}")
+            return None, "re_register"
+
         print(f"❌ Task request failed: {resp.status_code} {resp.text}")
         return None, "failed"
 
@@ -1201,7 +1262,7 @@ def send_heartbeat(
     miner_id: str,
     capabilities: Dict,
     auth_token: Optional[str] = None,
-) -> bool:
+) -> Tuple[bool, str]:
     """Best-effort miner heartbeat to keep instance active."""
     try:
         resp = requests.post(
@@ -1210,9 +1271,15 @@ def send_heartbeat(
             headers=_auth_headers(auth_token),
             timeout=5,
         )
-        return resp.status_code == 200
+        if resp.status_code == 200:
+            return True, "ok"
+        if resp.status_code in (401, 403):
+            return False, "re_register"
+        if resp.status_code >= 500:
+            return False, "server_error"
+        return False, "failed"
     except Exception:
-        return False
+        return False, "network_error"
 
 
 def request_task_with_retry(
@@ -1244,6 +1311,8 @@ def request_task_with_retry(
             return task, "ok"
         if status == "no_task":
             return None, "no_task"
+        if status == "re_register":
+            return None, "re_register"
 
         fail_count += 1
         if fail_count < max_attempts:
@@ -1753,7 +1822,7 @@ def submit_gradient(
     gradient_data: Dict,
     metrics: Dict,
     auth_token: Optional[str] = None,
-) -> bool:
+) -> str:
     """Submit compressed gradient to PS with retry for transient failures."""
     # Compute hash once to avoid repeated serialization work on retries.
     gradient_bytes = json.dumps(gradient_data, sort_keys=True).encode()
@@ -1782,7 +1851,11 @@ def submit_gradient(
                 score_val = result.get("score", "N/A")
                 score_str = f"{score_val:.4f}" if isinstance(score_val, (int, float)) else str(score_val)
                 print(f"✅ Gradient accepted! Score: {score_str}")
-                return True
+                return "ok"
+
+            if resp.status_code in (401, 403):
+                print(f"⚠️ Gradient submission unauthorized: {resp.status_code}")
+                return "re_register"
 
             # 4xx usually means semantic rejection; no retry.
             if 400 <= resp.status_code < 500:
@@ -1790,7 +1863,7 @@ def submit_gradient(
                 print(f"❌ Gradient rejected: {resp.status_code}")
                 print(f"   Reason: {error_data.get('reason', 'Unknown')}")
                 print(f"   Score: {error_data.get('score', 'N/A')}")
-                return False
+                return "rejected"
 
             # 5xx can be transient; retry.
             raise requests.exceptions.RequestException(
@@ -1803,7 +1876,9 @@ def submit_gradient(
                 time.sleep(10)
             else:
                 print("⚠️ Submission failed after 3 attempts, discarding this gradient and requesting next task")
-                return False
+                return "retryable_failed"
+
+    return "retryable_failed"
 
     return False
 
@@ -1869,7 +1944,7 @@ def main():
             print("   Run: python3 alice_node.py wallet create")
             print("   Or:  python3 alice_node.py mine --address YOUR_ADDRESS")
             sys.exit(1)
-    args.ps_url = str(args.ps_url).strip().rstrip("/")
+    args.ps_url = _normalize_base_url(args.ps_url)
 
     # Fail fast if model runtime is missing; avoids wasting time downloading 13GB then crashing.
     if not ALICE_MODEL_AVAILABLE:
@@ -1941,8 +2016,12 @@ def main():
                 capabilities["reward_address"] = args.reward_address
                 print(f"💰 Reward address: {args.reward_address[:12]}...")
 
+            route_info = discover_work_endpoint(args.ps_url, miner_hint=wallet_address)
+            work_url = str(route_info.get("work_url") or args.ps_url)
+            heartbeat_failures = 0
+
             register_response = register_miner_with_retry(
-                args.ps_url,
+                work_url,
                 wallet_address,
                 miner_instance_id,
                 capabilities,
@@ -1960,7 +2039,7 @@ def main():
             pending_task: Optional[Dict[str, Any]] = None
             while pending_task is None:
                 task, status = request_task_with_retry(
-                    args.ps_url,
+                    work_url,
                     miner_instance_id,
                     capabilities,
                     auth_token=auth_token,
@@ -1971,7 +2050,22 @@ def main():
                     pending_task = task
                     break
                 if status == "no_task":
-                    send_heartbeat(args.ps_url, miner_instance_id, capabilities, auth_token=auth_token)
+                    hb_ok, hb_reason = send_heartbeat(
+                        work_url,
+                        miner_instance_id,
+                        capabilities,
+                        auth_token=auth_token,
+                    )
+                    if hb_ok:
+                        heartbeat_failures = 0
+                    else:
+                        heartbeat_failures += 1
+                        print(
+                            f"⚠️ Heartbeat failed via {work_url}: reason={hb_reason} "
+                            f"(consecutive={heartbeat_failures})"
+                        )
+                        if hb_reason == "re_register" or heartbeat_failures >= 3:
+                            break
                     time.sleep(10)
                     continue
                 if status == "re_register":
@@ -1979,8 +2073,8 @@ def main():
 
             if pending_task is None:
                 # Could not acquire task after retries; restart registration flow.
-                print("⚠️ Could not acquire task after retries, re-registering...")
-                time.sleep(30)
+                print("⚠️ Could not acquire task after retries, rediscovering work endpoint...")
+                time.sleep(5)
                 continue
 
             assigned_layers = pending_task.get("assigned_layers", [0, 1, 2, 3, 4, 5, 6, 7])
@@ -2246,7 +2340,7 @@ def main():
                     pending_task = None
                 else:
                     task, status = request_task_with_retry(
-                        args.ps_url,
+                        work_url,
                         miner_instance_id,
                         capabilities,
                         auth_token=auth_token,
@@ -2254,12 +2348,31 @@ def main():
                         max_attempts=5,
                     )
                     if status == "no_task":
-                        send_heartbeat(args.ps_url, miner_instance_id, capabilities, auth_token=auth_token)
+                        hb_ok, hb_reason = send_heartbeat(
+                            work_url,
+                            miner_instance_id,
+                            capabilities,
+                            auth_token=auth_token,
+                        )
+                        if hb_ok:
+                            heartbeat_failures = 0
+                        else:
+                            heartbeat_failures += 1
+                            print(
+                                f"⚠️ Heartbeat failed via {work_url}: reason={hb_reason} "
+                                f"(consecutive={heartbeat_failures})"
+                            )
+                            if hb_reason == "re_register" or heartbeat_failures >= 3:
+                                print("⚠️ Work endpoint unhealthy, re-running discovery...")
+                                break
                         time.sleep(10)
                         continue
                     if status == "re_register" or task is None:
                         print("⚠️ Re-registering after repeated task request failures...")
                         break
+
+                if task is None:
+                    break
 
                 task_id = task["task_id"]
                 shard_id = task["shard_id"]
@@ -2272,13 +2385,13 @@ def main():
                 # Download shard
                 print(f"📥 Downloading shard {shard_id}...")
                 shard_data = download_shard_streaming(
-                    args.ps_url,
+                    work_url,
                     shard_id,
                     auth_token=auth_token,
                 )
                 if shard_data is None:
-                    print("❌ Shard download failed, skipping task")
-                    continue
+                    print("❌ Shard download failed, rediscovering work endpoint...")
+                    break
 
                 # Train
                 print(f"🎯 Training shard {shard_id} (layers {len(assigned_layers)}/{n_layers})...")
@@ -2408,15 +2521,15 @@ def main():
                 }
 
                 print("📤 Submitting gradient...")
-                success = submit_gradient(
-                    args.ps_url,
+                submit_status = submit_gradient(
+                    work_url,
                     task_id,
                     task_nonce,
                     compressed,
                     metrics,
                     auth_token=auth_token,
                 )
-                if success:
+                if submit_status == "ok":
                     gradients_accepted += 1
                     save_device_profile(
                         profile_path,
@@ -2465,7 +2578,7 @@ def main():
                                 retry_caps = dict(capabilities)
                                 retry_caps["memory_gb"] = float(new_mem_cap)
                                 register_miner_with_retry(
-                                    args.ps_url,
+                                    work_url,
                                     wallet_address,
                                     miner_instance_id,
                                     retry_caps,
@@ -2473,9 +2586,15 @@ def main():
                                 )
                                 os.execv(sys.executable, [sys.executable] + sys.argv)
                     print(f"✅ Task {task_id[:8]}... completed in {train_time:.1f}s\n")
-                else:
+                elif submit_status == "rejected":
                     gradients_rejected += 1
                     print(f"❌ Task {task_id[:8]}... failed\n")
+                else:
+                    print(
+                        f"⚠️ Submission path unhealthy via {work_url}: status={submit_status}. "
+                        "Rediscovering work endpoint..."
+                    )
+                    break
 
                 if tasks_processed % 10 == 0:
                     uptime = format_uptime(time.time() - miner_start_time)
