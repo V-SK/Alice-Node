@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 a = Analysis(
-    ['alice_miner.py'],
+    ['alice_node.py'],
     pathex=[],
     binaries=[],
     datas=[

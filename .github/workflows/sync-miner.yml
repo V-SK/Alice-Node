@@ -8,10 +8,8 @@ on:
       - 'src/**'
       - 'core/**'
       - 'alice_node.py'
-      - 'alice_miner.py'
       - 'requirements.txt'
       - 'start_mining.sh'
-      - 'stop_mining.sh'
       - 'install.sh'
   workflow_dispatch:
 
@@ -30,15 +28,12 @@ jobs:
           tar czf alice-miner-latest.tar.gz \
             --transform 's,^,alice-miner/,' \
             alice_node.py \
-            alice_miner.py \
             miner/ \
             core/ \
             src/ \
             requirements.txt \
             start_mining.sh \
-            stop_mining.sh \
-            install.sh \
-            2>/dev/null || true
+            install.sh
           
           # Generate checksum
           sha256sum alice-miner-latest.tar.gz > alice-miner-latest.tar.gz.sha256
@@ -65,9 +60,5 @@ jobs:
           script: |
             echo "✅ Miner package synced at $(date)"
             ls -lh /data/models/miner/alice-miner-latest.tar.gz
-            
-            # Also update the standalone miner script for direct downloads
-            cd /data/models/miner
-            tar xf alice-miner-latest.tar.gz --strip-components=1 alice-miner/alice_miner_v2.py 2>/dev/null || true
             
             echo "Sync complete"

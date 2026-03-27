@@ -399,7 +399,7 @@ class ScoringServer:
             "shard_id": 12345,
             "miner_id": "aXXX...alice-address",
             "epoch_id": 7,
-            "gradient_url": "http://65.109.84.107:8888/gradients/uuid.bin"
+            "gradient_url": "https://ps.aliceprotocol.org/gradients/uuid.bin"
         }
         
         Response (JSON):

@@ -67,11 +67,25 @@ def cmd_score(args):
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scorer"))
     from scoring_server import main as scorer_main
 
-    sys.argv = ["scoring_server", "--port", str(args.port), "--device", args.device]
+    sys.argv = [
+        "scoring_server",
+        "--port",
+        str(args.port),
+        "--device",
+        args.device,
+        "--host",
+        args.host,
+        "--model-version",
+        str(args.model_version),
+        "--num-val-shards",
+        str(args.num_val_shards),
+    ]
     if args.model_path:
         sys.argv += ["--model-path", args.model_path]
     if args.validation_dir:
         sys.argv += ["--validation-dir", args.validation_dir]
+    if args.ps_url:
+        sys.argv += ["--ps-url", args.ps_url]
     scorer_main()
 
 
@@ -152,9 +166,18 @@ Learn more: https://aliceprotocol.org
     # ── Score ─────────────────────────────────────────────────────────
     p_score = subparsers.add_parser("score", help="Start scoring — validate miner gradients")
     p_score.add_argument("--port", type=int, default=8090, help="Scorer HTTP port (default: 8090)")
+    p_score.add_argument("--host", default="0.0.0.0", help="Scorer bind host (default: 0.0.0.0)")
     p_score.add_argument("--device", default="cpu", help="Device: cpu, cuda, mps (default: cpu)")
     p_score.add_argument("--model-path", help="Path to model weights")
     p_score.add_argument("--validation-dir", help="Path to validation shards directory")
+    p_score.add_argument("--model-version", type=int, default=0, help="Initial model version")
+    p_score.add_argument(
+        "--num-val-shards",
+        type=int,
+        default=5,
+        help="Number of validation shards to use (default: 5)",
+    )
+    p_score.add_argument("--ps-url", default=DEFAULT_PS_URL, help="Parameter server URL for auto-update")
     p_score.set_defaults(func=cmd_score)
 
     # ── Aggregate ─────────────────────────────────────────────────────

@@ -37,7 +37,7 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
 
-      - name: Build binary
+      - name: Build unified alice-node miner binary
         run: pyinstaller alice-miner.spec
 
       - name: Rename artifact

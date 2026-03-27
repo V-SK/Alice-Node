@@ -87,7 +87,7 @@ fn get_miner_command() -> (String, Vec<String>) {
     #[cfg(not(target_os = "windows"))]
     let python = "python3";
 
-    (python.to_string(), vec!["alice_miner.py".to_string()])
+    (python.to_string(), vec!["alice_node.py".to_string()])
 }
 
 #[tauri::command]
@@ -127,7 +127,8 @@ pub fn start_mining(
     for arg in &prefix_args {
         cmd.arg(arg);
     }
-    cmd.arg("--ps-url")
+    cmd.arg("mine")
+        .arg("--ps-url")
         .arg(&ps_url)
         .arg("--address")
         .arg(&wallet_address)

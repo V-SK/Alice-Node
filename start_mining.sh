@@ -7,7 +7,7 @@ PS_URL="https://ps.aliceprotocol.org"
 PRECISION="fp16"
 LOG_DIR="logs"
 PYTHON_BIN="python3"
-MINER_SCRIPT="alice_miner.py"
+MINER_SCRIPT="alice_node.py"
 DRY_RUN=0
 EXTRA_ARGS=()
 
@@ -103,10 +103,10 @@ if [[ "$PS_URL" == http://* ]]; then
 fi
 
 # Stop old miners for this address only
-mapfile -t OLD_PIDS < <(pgrep -af "alice_miner.py" | awk -v a="$ADDRESS" '$0 ~ ("--address " a) {print $1}')
+mapfile -t OLD_PIDS < <(pgrep -af "alice_node.py mine" | awk -v a="$ADDRESS" '$0 ~ ("--address " a) {print $1}')
 if [[ ${#OLD_PIDS[@]} -gt 0 ]]; then
   echo "Stopping ${#OLD_PIDS[@]} existing miner process(es) for address $ADDRESS..."
-  kill "${OLD_PIDS[@]}" 2>/dev/null || true
+  kill "${OLD_PIDS[@]}"
   sleep 1
 fi
 
@@ -143,7 +143,7 @@ for t in "${TARGETS[@]}"; do
 
   INSTANCE_ID=""
   LOG_PATH=""
-  CMD=("$PYTHON_BIN" "$MINER_SCRIPT" "--ps-url" "$PS_URL" "--precision" "$PRECISION")
+  CMD=("$PYTHON_BIN" "$MINER_SCRIPT" "mine" "--ps-url" "$PS_URL" "--precision" "$PRECISION")
   if [[ -n "$ADDRESS" ]]; then
     CMD+=("--address" "$ADDRESS")
   fi

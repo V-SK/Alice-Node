@@ -12,10 +12,10 @@ echo "Building alice-miner-core..."
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
-# Check if miner script exists
-if [ ! -f "$MINER_DIR/alice_miner_v2.py" ]; then
-    echo "Error: alice_miner_v2.py not found in $MINER_DIR"
-    echo "Please copy the miner script to miner-core/ directory"
+ENTRY_SCRIPT="alice_node.py"
+if [ ! -f "$MINER_DIR/$ENTRY_SCRIPT" ]; then
+    echo "Error: no miner entry script found in $MINER_DIR"
+    echo "Expected alice_node.py"
     exit 1
 fi
 
@@ -34,7 +34,7 @@ pyinstaller \
     --hidden-import websocket \
     --strip \
     --noconfirm \
-    alice_miner_v2.py
+    "$ENTRY_SCRIPT"
 
 # Copy to binaries directory
 cp dist/alice-miner-core "$OUTPUT_DIR/"

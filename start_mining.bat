@@ -29,6 +29,6 @@ if %errorlevel% equ 0 (
 echo Starting miner on %DEVICE%...
 echo.
 
-python alice_miner.py --ps-url https://ps.aliceprotocol.org --device %DEVICE% --allow-insecure
+python alice_node.py mine --ps-url https://ps.aliceprotocol.org --device %DEVICE%
 
 pause

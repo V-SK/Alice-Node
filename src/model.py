@@ -15,12 +15,21 @@ from torch.utils.checkpoint import checkpoint
 
 @dataclass
 class AliceConfig:
-    """Alice-7B model configuration (Genesis model)"""
+    """Alice-7B model configuration (Genesis model).
+
+    Backward-compat note:
+    Older miner packages may still construct this config with legacy
+    transformer-style kwargs like `num_kv_heads` / `num_hidden_layers`.
+    Accept them as aliases so mixed-version Windows packages do not crash
+    during startup before the real miner logic runs.
+    """
     # Architecture
     num_layers: int = 32
+    num_hidden_layers: int | None = None
     hidden_dim: int = 4096
     intermediate_size: int = 11008  # 2.7x hidden for SwiGLU
     num_attention_heads: int = 32
+    num_kv_heads: int | None = None
     head_dim: int = 128  # hidden_dim / num_heads
     
     # Vocabulary & Context
@@ -35,6 +44,14 @@ class AliceConfig:
     initializer_range: float = 0.02
     
     def __post_init__(self):
+        if self.num_hidden_layers is None:
+            self.num_hidden_layers = self.num_layers
+        else:
+            self.num_layers = self.num_hidden_layers
+
+        if self.num_kv_heads is None:
+            self.num_kv_heads = self.num_attention_heads
+
         assert self.hidden_dim % self.num_attention_heads == 0
         assert self.head_dim == self.hidden_dim // self.num_attention_heads
 
