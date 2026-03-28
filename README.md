@@ -144,3 +144,19 @@ Requires: Node.js 18+, Rust 1.75+
 ## License
 
 MIT
+
+## Staking Requirements
+
+To run an aggregator node, you must stake **20,000 ALICE** tokens.
+
+### Steps
+1. Get ALICE tokens from mining or exchange
+2. Call `stake_as_aggregator(amount=20000)` extrinsic on Alice chain
+3. Register with PS using your staked address
+4. Start the aggregator service
+
+### Hardware Requirements
+- 64GB RAM
+- 1TB SSD
+- 500Mbps network
+- Stable connection to PS and miners
